@@ -1,0 +1,745 @@
+import argparse
+import copy
+import os
+import random as rd
+
+import logging
+import torch.nn as nn
+import torchvision.utils
+from torch.utils.tensorboard import SummaryWriter
+from torch.utils.data import Subset
+import numpy as np
+import torch
+import time
+import torchvision
+from mytimm.models import create_model
+from mytimm.utils import *
+# from train_efficientnet import load_multimodel
+from evolution_baseline import EvolutionFinder
+import torchvision.transforms as transforms
+import timm
+# import mytools
+# from train_efficientnet import load_multimodel, load_to_MultiModel
+from AdaptiveNet import oncloud
+parser = argparse.ArgumentParser(description='evolution finder', add_help=False)
+parser.add_argument('-c', '--config', default='', type=str, metavar='FILE',
+                    help='YAML config file specifying default arguments')
+
+# parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
+
+
+
+# Dataset parameters
+parser.add_argument('--data_dir', metavar='DIR',
+                    help='path to dataset')
+parser.add_argument('--dataset', '-d', metavar='NAME', default='',
+                    help='dataset type (default: ImageFolder/ImageTar if empty)')
+parser.add_argument('--train-split', metavar='NAME', default='train',
+                    help='dataset train split (default: train)')
+parser.add_argument('--val-split', metavar='NAME', default='validation',
+                    help='dataset validation split (default: validation)')
+parser.add_argument('--dataset-download', action='store_true', default=False,
+                    help='Allow download of dataset for torch/ and tfds/ datasets that support it.')
+parser.add_argument('--class-map', default='', type=str, metavar='FILENAME',
+                    help='path to class to idx mapping file (default: "")')
+
+parser.add_argument('--bn-momentum', type=float, default=None,
+                    help='BatchNorm momentum override (if not None)')
+parser.add_argument('--bn-eps', type=float, default=None,
+                    help='BatchNorm epsilon override (if not None)')
+
+parser.add_argument('--drop', type=float, default=0.0, metavar='PCT',
+                    help='Dropout rate (default: 0.)')
+parser.add_argument('--drop-connect', type=float, default=None, metavar='PCT',
+                    help='Drop connect rate, DEPRECATED, use drop-path (default: None)')
+parser.add_argument('--drop-path', type=float, default=None, metavar='PCT',
+                    help='Drop path rate (default: None)')
+parser.add_argument('--drop-block', type=float, default=None, metavar='PCT',
+                    help='Drop block rate (default: None)')
+
+# Model parameters
+parser.add_argument('--model', default='resnet50', type=str, metavar='MODEL',
+                    help='Name of model to train (default: "resnet50"')
+parser.add_argument('--pretrained', action='store_true', default=False,
+                    help='Start with pretrained version of specified network (if avail)')
+parser.add_argument('--initial-checkpoint', default='', type=str, metavar='PATH',
+                    help='Initialize model from this checkpoint (default: none)')
+parser.add_argument('--resume', default='', type=str, metavar='PATH',
+                    help='Resume full model and optimizer state from checkpoint (default: none)')
+parser.add_argument('--no-resume-opt', action='store_true', default=False,
+                    help='prevent resume of optimizer state when resuming model')
+parser.add_argument('--num-classes', type=int, default=None, metavar='N',
+                    help='number of label classes (Model default if None)')
+parser.add_argument('--gp', default=None, type=str, metavar='POOL',
+                    help='Global pool type, one of (fast, avg, max, avgmax, avgmaxc). Model default if None.')
+parser.add_argument('--img-size', type=int, default=None, metavar='N',
+                    help='Image patch size (default: None => model default)')
+parser.add_argument('--input-size', default=None, nargs=3, type=int,
+                    metavar='N N N',
+                    help='Input all image dimensions (d h w, e.g. --input-size 3 224 224), uses model default if empty')
+parser.add_argument('--crop-pct', default=None, type=float,
+                    metavar='N', help='Input image center crop percent (for validation only)')
+parser.add_argument('--mean', type=float, nargs='+', default=None, metavar='MEAN',
+                    help='Override mean pixel value of dataset')
+parser.add_argument('--std', type=float, nargs='+', default=None, metavar='STD',
+                    help='Override std deviation of of dataset')
+parser.add_argument('--interpolation', default='', type=str, metavar='NAME',
+                    help='Image resize interpolation type (overrides model)')
+parser.add_argument('-b', '--batch-size', type=int, default=128, metavar='N',
+                    help='input batch size for training (default: 128)')
+parser.add_argument('-vb', '--validation-batch-size', type=int, default=None, metavar='N',
+                    help='validation batch size override (default: None)')
+
+parser.add_argument('--model_path', metavar='DIR',
+                    help='path to trained model')
+
+parser.add_argument('--torchscript', dest='torchscript', action='store_true',
+                    help='convert model torchscript for inference')
+parser.add_argument("--local_rank", default=0, type=int)
+
+parser.add_argument('--no-prefetcher', action='store_true', default=False,
+                    help='disable fast prefetcher')
+parser.add_argument('--pin-mem', action='store_true', default=False,
+                    help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
+parser.add_argument('-j', '--workers', type=int, default=4, metavar='N',
+                    help='how many training processes to use (default: 4)')
+parser.add_argument('--channels-last', action='store_true', default=False,
+                    help='Use channels_last memory layout')
+parser.add_argument('--tta', type=int, default=0, metavar='N',
+                    help='Test/inference time augmentation (oversampling) factor. 0=None (default: 0)')
+parser.add_argument('--GPU', action='store_true', default=False,
+                    help='Use GPU')
+parser.add_argument("--log_interval", default=200, type=int)
+parser.add_argument("--warmupbatches", default=10, type=int)
+parser.add_argument('--pths_path', metavar='DIR',
+                    help='path to trained model')
+parser.add_argument('--slim', action='store_true', default=False)
+parser.add_argument('--use_subset', action='store_true', default=False)
+parser.add_argument("--batch_size_for_lat", default=1, type=int)
+parser.add_argument('--pruned', action='store_true', default=False)
+
+parser.add_argument('--data_aware', action='store_true', default=False)
+parser.add_argument('--randomlysample', action='store_true', default=False)
+parser.add_argument('--test_effi', action='store_true', default=False)
+parser.add_argument('--dirichlet_alpha', type=float, default=None,
+                    help='BatchNorm momentum override (if not None)')
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+_logger = logging.getLogger('train')
+
+def load_multimodel(model, path):
+    # model.load_state_dict(torch.load(path), strict=True)
+    state = {}
+    model_dict = model.state_dict()
+    pretrained_model = torch.load(path, map_location=torch.device('cpu'))
+    for k, v in pretrained_model.items():
+        # print(k)
+        key = k[7:] if "module" in k else k
+        state[key] = v
+    model_dict.update(state)
+    model.load_state_dict(model_dict)
+    for (name, parameter) in model.named_parameters():
+        # print(name)
+        name_list = name.split('.')
+        if name_list[0] == "multiblocks" and name_list[2] == "0":
+            print(";;;", name)
+            parameter.requires_grad = False
+        if name_list[0] == "conv_stem" or name_list[0] == "bn1" or name_list[0] == "bn2" or name_list[0] == "conv_head":
+            print(";;;", name)
+            parameter.requires_grad = False
+        if "classifier" in name:
+            parameter.requires_grad = False
+            print(";;;", name)
+        # if ("multiblocks" in name and (name[14] == "0" or name[15] == "0")) or "classifier" in name or "conv_head" in name \
+        #         or "conv_stem" in name or name == "bn1.weight" or name == "bn1.bias":
+        # print(";;;;", name)
+        # parameter.requires_grad = False
+    # del pretrained_model
+    return model
+
+def test_lat(block, input, test_times):
+    x = torch.rand(input.shape).cuda()
+    block.cuda()
+    lats = []
+    for i in range(test_times):
+        t1 = time.time()
+        y = block(x)
+        torch.cuda.synchronize()
+        t2 = time.time() - t1
+        if i > 200:
+            lats.append(t2)
+        del y
+    del x
+    return np.mean(lats)
+
+def get_resnet_lats(model, batchsize, test_times=1000):
+    print("started testing latencys")
+    model.eval()
+    model.cuda()
+    x = torch.rand(batchsize, 3, 224, 224).cuda()  # 224
+    lats = []
+    layers = [model.conv1, model.bn1, model.act1, model.maxpool]
+    former_layers = nn.Sequential(*layers)
+    former_layers.cuda()
+    # x.cuda()
+    lats.append(test_lat(former_layers, x, test_times))
+    x = former_layers(x)
+    for blockidx in range(len(model.multiblocks)):
+        print("testing latency for the",blockidx, "block")
+        lats.append([])
+        for choiceidx in range(len(model.multiblocks[blockidx])):
+            block = copy.deepcopy(model.multiblocks[blockidx][choiceidx])
+            lats[-1].append(test_lat(block, x, test_times))
+        x = model.multiblocks[blockidx][0](x)
+    f_layers = [model.global_pool, model.fc]
+    latter_layers = nn.Sequential(*f_layers)
+    lats.append(test_lat(latter_layers, x, test_times))
+    return lats
+
+def get_mbv_lats(model, batchsize, test_times=1000):
+    model.eval()
+    model.cuda()
+    x = torch.rand(batchsize, 3, 288, 288).cuda()  # 224 384 416
+    lats = []
+    layers = [model.conv_stem, model.bn1, model.act1]
+    former_layers = nn.Sequential(*layers)
+    # former_layers.cuda()
+    # x.cuda()
+    lats.append(test_lat(former_layers, x, test_times))
+    x = former_layers(x)
+    del former_layers
+    for blockidx in range(len(model.multiblocks)):
+        lats.append([])
+        for choiceidx in range(len(model.multiblocks[blockidx])):
+            block = copy.deepcopy(model.multiblocks[blockidx][choiceidx])
+            lats[-1].append(test_lat(block, x, test_times))
+        x = model.multiblocks[blockidx][0](x)
+    f_layers = [model.conv_head, model.bn2, model.act2, model.global_pool, model.classifier]
+    latter_layers = nn.Sequential(*f_layers)
+    lats.append(test_lat(latter_layers, x, test_times))
+    return lats
+
+def validate(model, loader, subnet, args, loss_fn, lats):
+    print(subnet)
+    batch_time_m = AverageMeter()
+    losses_m = AverageMeter()
+    top1_m = AverageMeter()
+    top5_m = AverageMeter()
+    # model = copy.deepcopy(originalmodel)
+    # model.adjust_multiblocks_to_subnet(subnet)
+    # model = mytools.get_resnet_model_from_subnet(originalmodel, subnet, args.pths_path)
+    lat = lats[0]
+    # print(subnet)
+    for blockidx in range(len(subnet)):
+        if subnet[blockidx] != 99:
+            # print(blockidx, subnet[blockidx])
+            lat += lats[blockidx+1][subnet[blockidx]]
+    lat += lats[-1]
+    if args.GPU:
+        model.cuda()
+    model.eval()
+    end = time.time()
+    # import pdb;pdb.set_trace()
+    last_idx = len(loader) - 1
+    total_time = 0
+    with torch.no_grad():
+        for batch_idx, (input, target) in enumerate(loader):
+            # print(batch_idx)
+            # print(batch_idx, input.shape, target.shape)
+            last_batch = batch_idx == last_idx
+            if args.GPU:
+                input = input.cuda()
+                target = target.cuda()
+            if args.channels_last:
+                input = input.contiguous(memory_format=torch.channels_last)
+            # with amp_autocast():
+            t1 = time.time()
+            # if teachermodel:
+            #     output = model(input)
+            # else:
+            #     output = model(input, subnet)
+            output = model(input, subnet)
+            if batch_idx >= args.warmupbatches:
+                total_time += (time.time() - t1)
+            if isinstance(output, (tuple, list)):
+                output = output[0]
+
+            # augmentation reduction
+            reduce_factor = args.tta
+            if reduce_factor > 1:
+                output = output.unfold(0, reduce_factor, reduce_factor).mean(dim=2)
+                target = target[0:target.size(0):reduce_factor]
+            loss = loss_fn(output, target)
+            acc1, acc5 = accuracy(output, target, topk=(1, 5))
+
+            if args.distributed:
+                reduced_loss = reduce_tensor(loss.data, args.world_size)
+                # if stage == 3:
+                acc1 = reduce_tensor(acc1, args.world_size)
+                acc5 = reduce_tensor(acc5, args.world_size)
+            else:
+                reduced_loss = loss.data
+
+            # torch.cuda.synchronize()
+
+            losses_m.update(reduced_loss.item(), input.size(0))
+            # if stage == 3:
+            top1_m.update(acc1.item(), output.size(0))
+            top5_m.update(acc5.item(), output.size(0))
+
+            batch_time_m.update(time.time() - end)
+            end = time.time()
+            # print("over")
+            # if last_batch:#or (batch_idx % args.log_interval == 0):
+            #     # print(subnet, subnetchoice)
+            #     log_name = 'Test'
+            #     print(log_name, "batchidx:", batch_idx, "latency", batch_time_m.avg,
+            #             "loss", losses_m.avg, "acc", top1_m.avg)
+    # total_time /= (last_idx + 1 - args.warmupbatches)
+    # del model
+    print(top1_m.avg, lat, subnet)
+    return top1_m.avg, lat
+
+def warmup(model, args, warmuptime, teachermodel=False, subnet=None):
+    x = torch.randn(args.batch_size, 3, 224, 224)
+    if args.GPU:
+        x.cuda()
+    for _ in range(warmuptime):
+        if teachermodel:
+            output = model(x)
+        else:
+            output = model(x, subnet)
+
+
+def main():
+    args = parser.parse_args()
+    args.prefetcher = not args.no_prefetcher
+    args.distributed = False
+    args.world_size = 1
+    model = create_model(
+        args.model,
+        pretrained=args.pretrained,
+        num_classes=args.num_classes,)
+        # drop_rate=args.drop,
+        # drop_connect_rate=args.drop_connect,  # DEPRECATED, use drop_path
+        # drop_path_rate=args.drop_path,
+        # drop_block_rate=args.drop_block,
+        # global_pool=args.gp,
+        # bn_momentum=args.bn_momentum,
+        # bn_eps=args.bn_eps,
+        # scriptable=args.torchscript,
+        # checkpoint_path=args.initial_checkpoint)
+    if 'resnet' in args.model:
+        model.get_skip_blocks(more_options=False)
+        if args.pruned:
+            teachermodel = timm.create_model(args.model, pretrained=True)
+            prune_modules = oncloud.prune_model(teachermodel, [0.2, 0.4])
+            model.get_pruned_module(prune_modules)
+            del teachermodel
+    # import pdb;pdb.set_trace()
+
+
+    # if args.slim:
+    #     model.adjust_channels()
+    #     model.get_multi_blocks()
+    if 'mobilenetv2' in args.model:
+    #     layer_lens = []
+    #     for layeridx in range(len(model.blocks)):
+    #         layerlen = len(model.blocks[layeridx])
+    #         # if layeri
+    #         for blockidx in range(len(model.blocks[layeridx])): # note that we did not prune the last block
+    #             layer_lens.append(layerlen)
+        model.get_multi_blocks()
+        if args.pruned:
+            teachermodel = timm.create_model(args.model, pretrained=True)
+            prune_modules = oncloud.prune_mbv2(teachermodel, [0.25, 0.5])
+            model.get_pruned_module(prune_modules)
+            del teachermodel
+    if 'efficientnet' in args.model:
+        model.get_multi_blocks()
+        # load_to_MultiModel(model, '/home/wenh/Desktop/newproject1/pytorch-image-models-master/pretrainedweight/efficientnetv2_t_agc-3620981a.pth')
+        # load_multimodel(model, args.model_path)
+        load_multimodel(model, args.model_path)
+    else:
+        model.load_state_dict(torch.load(args.model_path, map_location=torch.device('cpu')), strict=True)
+    print(model)
+
+    # if "resnet" in args.model:
+    #     lats = get_resnet_lats(model, batchsize=args.batch_size_for_lat)
+    # else:
+    #     lats = get_mbv_lats(model, batchsize=args.batch_size_for_lat)
+    # model.cuda()
+    # print(lats)
+    # # # name = 'npy/3090lats/' + args.model
+    # # # if args.pruned:
+    # # #     name += 'pruned'
+    # # # np.save(name + '.npy', lats)
+    # exit(0)
+
+    """jetson nano"""
+    '''resnet50 batchsize=1, done'''
+    # lats = [0.003638958053844031, [0.006113355375053891, 0.005743234851288556, 0.005781271784600605], [0.004910601421343443, 0.005286875377131944, 0.006455895892752453], [0.004999541119986952, 0.006436379856887869, 0.006102952670094162], [0.009373506176033148, 0.008862508180548116, 0.008866496708082117], [0.004035964857375741, 0.004172042859437872, 0.0040947458018427306], [0.004105430781641931, 0.004049013290915601, 0.006207328177614754], [0.004083707579800915, 0.006216889639761934, 0.006211243345585954], [0.010310401087221891, 0.010276270550628968, 0.010252549098088192], [0.004282641171611671, 0.004232876276890171, 0.004240252102497828], [0.004262510350715357, 0.004288678185198219, 0.004234122592071227], [0.004236986007180102, 0.004247698098122077, 0.0042633173059061615], [0.004238602309721369, 0.004316083563610064, 0.0063535337862761125], [0.0042528300779719015, 0.006390615450498651, 0.006383929364258629], [0.010920461603630346, 0.01082674396476618, 0.010998056086409452], [0.006491082169140462, 0.006471979179509906], [0.006481839661614153], 0.001289599715267934]
+    '''resnet50 batchsize=4, done'''
+    # lats = [0.013899708272621384, [0.021334774916786016, 0.02171199058609264, 0.021908763260346988], [0.01709380755855088, 0.017204371583102937, 0.015713458077165992], [0.017132256740710408, 0.01576305392593843, 0.01572934121989885], [0.024948938235790037, 0.02490687768993569, 0.024960148693327123], [0.014909839949081573, 0.014901111755881422, 0.014880870098254353], [0.014885840208634087, 0.01482675306773106, 0.01558971803722573], [0.0148708062825793, 0.015684568762380544, 0.01566683568284663], [0.02296106392723262, 0.022887702769659037, 0.022911974418920816], [0.01413700811839024, 0.014079594691860237, 0.014776292054549507], [0.017544491235229085, 0.014538556835723162, 0.014117837350902749], [0.014063760189707064, 0.014131338700004246, 0.01410383045872717], [0.014132376897295183, 0.014155660584618814, 0.023990986737917896], [0.014116811911796647, 0.023927883160951544, 0.02398213574718871], [0.039522721217228815, 0.03972718069784617, 0.039284722860840254], [0.01800396290909885, 0.018113593991384857], [0.01800860609099219], 0.0018275629317880075]
+    '''resnet101 batchsize=1, done'''
+    # lats = [0.003832263175887291, [0.005697158852008858, 0.005768513438677547, 0.005935271581013997], [0.0048128571173157355, 0.004808404228904031, 0.006011991789846709], [0.0047856653579557784, 0.005995331388531309, 0.006010125381777985], [0.008829020490550031, 0.008819199571705828, 0.008831965802895903], [0.004032753934763899, 0.004025016168151239, 0.004031337872900144], [0.004142262718894265, 0.004018790794141365, 0.0062322833321311255], [0.004038194213250671, 0.006206510042903399, 0.006221479839748806], [0.010374753162114307, 0.01030173927846581, 0.010300542369033352], [0.004232625768642233, 0.0042090680864122175, 0.00421348244252831], [0.004282469701285314, 0.004210363734852184, 0.004281643665198124], [0.004320924932306463, 0.0042396771787392975, 0.004220333966341886], [0.0044577964628585666, 0.004427437830452967, 0.004208087921142578], [0.004303284365721423, 0.0042128442513822304, 0.00426378876271874], [0.004370821846856011, 0.004258594127616497, 0.004235640920773901], [0.004278344337386314, 0.004223715175281872, 0.004253433208272915], [0.004357027285026781, 0.004262302861069188, 0.004355765352345476], [0.004235178533226552, 0.004268041764846956, 0.004222212415752989], [0.004225451536852904, 0.00431420345499058, 0.004254863719747524], [0.004310516395954171, 0.004264944731587112, 0.004228736415053859], [0.004257565796977341, 0.004227883888013435, 0.004232864187221334], [0.004258095616042012, 0.004300307745885367, 0.004242372031163687], [0.00429343454765551, 0.004224972291426225, 0.004253828164302941], [0.004301401099773368, 0.004321837666058781, 0.00431420345499058], [0.0042987857202086786, 0.0042603280809190534, 0.004321820808179451], [0.0043217365187827985, 0.004252267606330641, 0.004219327310119012], [0.004212247000800239, 0.004249331927058672, 0.004222190741336707], [0.0042215140178950145, 0.004234600548792367, 0.0042198836201369164], [0.004218640953603417, 0.004211312592631638, 0.004344745115800338], [0.004238665705979473, 0.004226397986363883, 0.006369374015114524], [0.00425969229804145, 0.006371486066567777, 0.0064072584865069145], [0.0110205038629397, 0.010929683242181335, 0.010915021703700827], [0.006592594011865481, 0.006522506174415049], [0.0066064969457761205], 0.0013181513006036932]
+    '''resnet101 batchsize=2, done'''
+    # lats = [0.006930837727556325, [0.010797218842939897, 0.010687974968341866, 0.010729601888945608], [0.00882400165904652, 0.008830157193270597, 0.008447148583152077], [0.0090416127985174, 0.00848355678596882, 0.008478788414386788], [0.014337698618570963, 0.014320879271536163, 0.014318986372514204], [0.008092757427331173, 0.008093352269644688, 0.008106544764354975], [0.008113121745562312, 0.008111997084184126, 0.012042459815439551], [0.008129208978980479, 0.011888046457309915, 0.011897089505436444], [0.017736512001114663, 0.017672124535146386, 0.017679520327635485], [0.007536016329370364, 0.007553702653056443, 0.007526773394960345], [0.007567593545624704, 0.007508029841413402, 0.007499620167896001], [0.007531296123157848, 0.007492884240969263, 0.007494695258863045], [0.007512781355116103, 0.0075210995144314235, 0.007496219692808209], [0.007523941271232836, 0.007499499754472213, 0.007566216016056562], [0.007518985054709695, 0.007514110719314729, 0.007512530895194622], [0.0074989699354075425, 0.0074971854084669946, 0.007490565078427093], [0.007476035994712753, 0.0074385248049341065, 0.007453742653432518], [0.007456606084650213, 0.007465776771005958, 0.007483930298776338], [0.0074617983114839805, 0.0074658706934765135, 0.007448914075138593], [0.007479436469800545, 0.007460839820630623, 0.007462819417317708], [0.00745257945975872, 0.007438753590439305, 0.007440008298315183], [0.007457682580658884, 0.007466952006022136, 0.007448302374945747], [0.007472584945986969, 0.007460244978317107, 0.007476394826715643], [0.007455789681636926, 0.007465184336960918, 0.0074378697559086965], [0.007514132393731011, 0.007485047735349097, 0.007456305051090742], [0.007495176912558199, 0.007460324451176807, 0.007450886447020251], [0.007487554742832377, 0.0074367523193359375, 0.0074905048717151985], [0.007431829818571457, 0.0077275290633692885, 0.007470766703287761], [0.007468471623430348, 0.007488913006252713, 0.007469610734419389], [0.007490386866559886, 0.007460572502829812, 0.01381194471108793], [0.007461123996310764, 0.013761163962007774, 0.013756985616202306], [0.022856473922729492, 0.022760143183698556, 0.022885303304652976], [0.010932421443438289, 0.010946543529780224], [0.010975384953046086], 0.0034206298866657297]
+    '''mbv2_100 batchsize=1'''
+    # lats = [0.0026512546348093744, [0.002322072672067131, 0.0011433276317472146, 0.0011543510551739456], [0.004505011670870291, 0.004468354963718501], [0.003829026281983034, 0.0021872711659672865, 0.002161235737621336], [0.002143882569812593, 0.0021593152431019567, 0.0021342310989112185], [0.0017902516482169169, 0.001802626707798855, 0.0017356436354175845], [0.0017820259084677637, 0.0017506675911427739, 0.0017406456452563294], [0.001739350177889181, 0.0017487100491248874, 0.0017499595058890513], [0.001844221487977451, 0.0018553829432131355, 0.0018448459175893837], [0.0018231522170523355, 0.00182516234261649, 0.0017302508342236205], [0.0018394250320013903, 0.0019641293021371788, 0.002026764073766264], [0.0017307880229519722, 0.0017350640213280393, 0.001734546551429538], [0.0018793628329322452, 0.001984068026817532, 0.001982833508560831], [0.0018796801268307487, 0.0017886819098527568, 0.0017959719014944589], [0.001775903510569331, 0.0017807459771483763, 0.0017808917769812104], [0.0018824168613978795, 0.002043023145288453, 0.00213795556759177], [0.0018950052428663823, 0.002144640250911091], [0.0021778820152569536], 0.002021204558829018]
+    '''mbv2_100 batchsize=4, done'''
+    # lats = [0.004343294559564805, [0.00855644364703568, 0.0023589558469920527, 0.002359407587457719], [0.017004082376198063, 0.016954549273153895], [0.013474810392336738, 0.006860506564453431, 0.006829716507952315], [0.006849607429408788, 0.00682622448244788, 0.006826581811546383], [0.004841409530257222, 0.00497018603752729, 0.0028142648233208142], [0.004823981072370869, 0.0028943465765855067, 0.002804771103058244], [0.0028674644336365816, 0.002820908276359539, 0.002887188043809475], [0.0031818142510894546, 0.0031019553803561025, 0.003169504323400053], [0.0032838036243180583, 0.003136797357621348, 0.003250490155136376], [0.0032945515816671807, 0.0032679968908018338, 0.003278703020330061], [0.0032852502693807273, 0.003353074678502286, 0.0032188247020979574], [0.004895654836095365, 0.004850036219546669, 0.003023088426518261], [0.004834692579761783, 0.0030247806606436135, 0.0030223899019093145], [0.0030165375922258037, 0.0030270184490614966, 0.003128166485549812], [0.003038599377586728, 0.0029893692274738973, 0.003965042587509729], [0.0031351553168810697, 0.0038926714942568823], [0.00394841662624426], 0.0034189863611283457]
+
+    '''pruned mbv2_100 batchsize=1'''
+    # lats = [0.002244498197894945, [0.002325713485105892, 0.0012783568007007876, 0.0012355968169401163], [0.004478979230225833, 0.004506860460553851, 0.0019579184682745683, 0.0015726208985598763], [0.003951185030447212, 0.0022044426815252855, 0.0023748892590515595, 0.002102237596248923, 0.0012221336364746094], [0.0022535186662411034, 0.0022222254808086503, 0.0022050784644028895, 0.001275457535172465, 0.0012734838595665188], [0.0017849012723841465, 0.0017944469786526863, 0.0017285932574355812, 0.0012264944855730636, 0.0012178456872925722], [0.0017790878028200385, 0.0017252380686595028, 0.0017289410258893082, 0.001216482100331395, 0.0012122628682836854], [0.0017215315261879063, 0.0017293073180922889, 0.0017210403480625391, 0.0012730566182530911, 0.0012262339580029174], [0.0019561921743522013, 0.00195094577053137, 0.0019536705542925305, 0.0013471808947417372, 0.0013891091024068962], [0.0019068807587587745, 0.0022186539824445147, 0.0019831962155220204, 0.0014337597036720219, 0.0014876369246862886], [0.0019498773684776516, 0.0017332271824504499, 0.0017323822604683706, 0.001289264898849908, 0.0013013525415482676], [0.0017404365061518543, 0.001731821170128079, 0.0017319484462116595, 0.0013002423116736544, 0.0013122791634466416], [0.0018712518209204041, 0.0018750479944367755, 0.0017524261522412598, 0.0012744190101336716, 0.0013035837570228672], [0.0018716581483233842, 0.0017654608963127423, 0.0017619599077038299, 0.0012772035479246824, 0.0013053112460258312], [0.001753316487286025, 0.0017577597969456722, 0.0017581583563247719, 0.0012801798961515115, 0.001331929276162819], [0.0018476023709863647, 0.0018549120814579172, 0.002061481165109123, 0.001299129691637847, 0.001268083887888973], [0.0018563109232967061, 0.002248582983375492, 0.001304330084855694, 0.001279685730324652], [0.002315059939123933], 0.0018064587337331365]
+    '''pruned mbv2_100 batchsize=4'''
+    # lats = [0.0043837338386969425, [0.008595514456962662, 0.002361472235076802, 0.0023604818809789957], [0.017095681416948505, 0.0170466836080902, 0.006500004924659347, 0.0035247738943450825], [0.013574810729776338, 0.006885939218527497, 0.006894235228216369, 0.006187938926211966, 0.003456551893100292], [0.0069211581877641455, 0.006916192064317174, 0.006908376081332714, 0.002925542684701773, 0.0017775101805211709], [0.004825901426997871, 0.004847265804890406, 0.002924122539252342, 0.002381221107814623, 0.0018832874936004944], [0.004832680807464498, 0.0028155687261983303, 0.002901479950716663, 0.002501565078429155, 0.001873124004606419], [0.0030227377263199926, 0.0028764890587848167, 0.002872761276653379, 0.0016009831508266487, 0.0016092919187003553], [0.0031510180852883634, 0.0031551764561579777, 0.0032064364506648136, 0.0016621761896139801, 0.0016144031664998236], [0.00310976688678448, 0.0031526718649975832, 0.0032806747334457958, 0.0016903167584269342, 0.001645028391809368], [0.0030817299782233093, 0.0032896429399981546, 0.003302865203806389, 0.0016484443957989032, 0.001602979009366753], [0.003377270140376777, 0.0033292706594818013, 0.0033645207267939846, 0.0016882730566936991, 0.0015390094706047338], [0.004968612090401028, 0.004881008811618971, 0.003210411422627427, 0.0025799346209369775, 0.0014301813565767729], [0.004845840875121662, 0.003102431727890984, 0.0032052379786768883, 0.0025255113939776468, 0.0017040652973596068], [0.0030221955034645106, 0.0030375523710729287, 0.003211393005473159, 0.0016130228903780016, 0.001312224761299465], [0.0029684755714442022, 0.003175147002357304, 0.0038843115037898953, 0.0016772818804584619, 0.0016537454215977902], [0.003149247089755974, 0.0040029737861658815, 0.0016563201827747766, 0.0016591158200267167], [0.003883247790129288], 0.003392003451701391]
+    '''pruned resnet50 bs=1'''
+    # lats = [0.003910575250182489, [0.005765664457070707, 0.005988573787188289, 0.005918184916178386, 0.005559817709103979, 0.00524696677622169], [0.004809875680942728, 0.004829035864935981, 0.006024408822107797, 0.004640006055735579, 0.004148208733760949], [0.004830064195575136, 0.006003560441913027, 0.0060311206663497775, 0.004648035222833807, 0.004522537944292781], [0.008825738020617552, 0.008844298545760338, 0.008851918307217684, 0.007360756999314434, 0.007200115858906448], [0.004022762028857915, 0.0040671416003294665, 0.004022913749771889, 0.004129973324862393, 0.004138664765791459], [0.004063786882342714, 0.004015956262145379, 0.006174212754374802, 0.00412546263800727, 0.004139900207519531], [0.004025507454920297, 0.006149007816507359, 0.006187289652198252, 0.004200196025347469, 0.004154927802808357], [0.01028796157451591, 0.010497647102433021, 0.010941490982518051, 0.009168579120828647, 0.007944658549145014], [0.004633698800597528, 0.004414897976499616, 0.004271264028067541, 0.004829488619409426, 0.002843945917457041], [0.004900612012304441, 0.004399940220996587, 0.004463949588814167, 0.004001157452361752, 0.0029743729215679746], [0.004234814884686711, 0.004441013239850902, 0.004310795755097361, 0.003808674186167091, 0.0030370986822879677], [0.004332788062818123, 0.0043700078521112, 0.006604726868446427, 0.0036680866973568694, 0.0030389361911349827], [0.004447014644892529, 0.007007126856331873, 0.007034658181546915, 0.003584307853621666, 0.002963003486093849], [0.011140575312604808, 0.011123158714988014, 0.011002658593534219, 0.009328635051997021, 0.007817904154459635], [0.006564410045893506, 0.006693584750397037, 0.004836159523087319, 0.003465231018837052], [0.006464401880900065, 0.004819518387919724, 0.0034559736348161794], 0.0014044588262384589]
+
+
+    """xiaomi"""
+    '''resnet50 batchsize=1'''
+    # lats = [4.68, [5.71, 5.22, 4.75], [5.22, 4.93, 5.16], [6.7, 7.34, 4.89], [8.22, 8.12, 9.44], [4.89, 4.66, 4.63], [4.53, 4.45, 4.6], [4.8, 4.61, 4.68], [7.75, 7.73, 7.69], [4.45, 4.41, 5.15], [4.42, 4.41, 4.44], [4.44, 4.51, 4.44], [4.44, 4.44, 4.91], [4.49, 5.87, 4.92], [8.6, 8.42, 8.32], [5.16, 5.18, ], [5.14], 0.28]
+    '''resnet50 batchsize=4'''
+
+    '''mobilenetv2 batchsize=1'''
+    # lats = [0.845, [1.2, 0.575, 0.66], [2.71, 2.705, 2.92], [1.395, 0.895, 0.8], [0.83, 0.81, 0.795], [0.565, 0.56, 0.405], [0.56, 0.405, 0.395], [0.445, 0.415, 0.415], [0.43, 0.425, 0.43], [0.435, 0.47, 0.635], [0.455, 0.465, 0.445], [0.44, 0.45, 0.46], [0.695, 0.685, 0.52], [0.665, 0.485, 0.485], [0.495, 0.515, 0.485], [0.495, 0.505, 0.655], [0.53, 0.63], [0.515], 0.59]
+    '''mobilenetv2 batchsize=4'''
+
+    '''resnet101 batchsize=1'''
+    # lats = [3.88, [5.66, 5.18, 4.7], [5.57, 4.88, 5.56], [9.18, 7.33, 5.41], [8.29, 8.34, 8.66], [4.89, 4.94, 5.28], [5.11, 6.69, 4.74], [6.62, 4.92, 5.58], [7.95, 7.89, 7.5], [4.54, 4.52, 4.52], [4.57, 4.56, 4.53], [4.55, 4.53, 4.55], [4.63, 4.55, 4.57], [4.53, 4.6, 4.56], [4.66, 4.76, 4.85], [4.68, 4.65, 4.66], [4.63, 4.64, 4.66], [4.94, 4.64, 4.63], [6.77, 6.41, 5.24], [6.79, 6.83, 6.85], [6.8, 6.82, 6.81], [6.76, 6.86, 6.71], [6.74, 6.75, 6.79], [6.85, 6.75, 7.17], [6.77, 6.76, 6.84], [6.71, 6.76, 6.79], [6.72, 6.73, 6.74], [6.76, 6.73, 6.71], [6.77, 6.82, 6.82], [6.78, 6.78, 7.14], [6.74, 7.15, 7.12], [12.4, 12.96, 11.83], [7.2, 7.13], [7.11], 0.38]
+    '''resnet101 batchsize=2'''
+
+    '''pruned mbv2 batchsize=1'''
+    # lats = [ 0.83, [1.09, 0.43, 0.43], [2.76, 2.71, 1.63, 0.9], [1.41, 0.84, 0.84, 0.82, 0.52], [0.83, 0.82, 0.82, 0.58, 0.39], [0.55, 0.56, 0.4, 0.43, 0.34], [0.55, 0.48, 0.4, 0.43, 0.34], [0.42, 0.34, 0.37, 0.3, 0.23], [0.43, 0.42, 0.43, 0.34, 0.22], [0.48, 0.43, 0.46, 0.33, 0.23], [0.42, 0.45, 0.46, 0.3, 0.23], [0.46, 0.46, 0.44, 0.31, 0.21], [1.26, 0.68, 0.5, 0.44, 0.3], [0.67, 0.49, 0.49, 0.39, 0.24], [0.52, 0.5, 0.49, 0.31, 0.23], [0.5, 0.52, 0.63, 0.36, 0.2], [0.51, 0.68, 0.28, 0.23], [0.64], 0.59]
+
+    '''pruned resnet50 bs=1'''
+    # lats = [ 3.55, [5.48, 6.38, 6.22, 4.08, 3.96], [7.35, 7.3, 5.18, 5.12, 3.35], [6.89, 5.92, 6.09, 5.97, 5.79], [9.0, 9.43, 8.85, 8.12, 6.35], [4.43, 4.39, 12.87, 4.42, 3.59], [4.36, 4.42, 4.63, 3.35, 2.59], [4.36, 4.62, 5.48, 3.37, 2.51], [9.98, 8.62, 8.29, 7.0, 5.8], [4.64, 4.56, 4.57, 3.47, 2.38], [4.75, 4.59, 4.55, 3.42, 2.37], [4.65, 4.62, 4.6, 3.41, 2.41], [4.63, 4.72, 5.01, 3.95, 2.47], [4.64, 5.02, 4.97, 3.48, 2.4], [11.54, 10.76, 9.91, 8.71, 6.14], [5.12, 5.3, 4.17, 3.03], [6.03, 4.0, 2.72], 0.37]
+
+    """3090"""
+    '''resnet50 batchsize=32'''
+    # lats = [0.0012113287093791557, [0.002341954967704076, 0.0023409929382935332, 0.0023392094240916685], [0.0019299148468857861, 0.0019439895997506954, 0.0017379407441064025], [0.0019318591966497735, 0.0017411840126123537, 0.0017397684209487017], [0.0023941009005855707, 0.00239323674513491, 0.002438997297322795], [0.001225991004399573, 0.0012253139433783195, 0.0012267808591916653], [0.00122773154954588, 0.0012281767567048532, 0.0012148232275016318], [0.0012279887670867881, 0.0012151765286251062, 0.0012152976774900816], [0.0017567495529881407, 0.0017916696689304929, 0.0017557982658414877], [0.0009494063552837348, 0.0009530017313282839, 0.0009521432454057868], [0.0009502463406406446, 0.000951601954664247, 0.0009512394032579788], [0.000951425900894948, 0.0009514685715542866, 0.0009513450355195581], [0.0009534248571670398, 0.0009519767403155006, 0.001221432703755824], [0.000994692755879389, 0.001224763402353986, 0.001223958030958498], [0.0017232778522935468, 0.001727903292086605, 0.0017273115723840287], [0.000916403435049427, 0.000914932043292794], [0.000912612609481334], 5.8494014047711005e-05]
+    '''resnet50 batchsize=1'''
+    # lats = [7.32661188767759e-05, [0.0001671490293271252, 0.00016489524268387853, 0.00016325883781805503], [0.00014547830230751086, 0.00013670127591740652, 0.0001611536524919455], [0.00013322227439832628, 0.00015106845707708367, 0.00015451553020071477], [0.00017101146998781437, 0.00016753157328007665, 0.00016218222425935861], [0.00014589933937273275, 0.00014182414220778903, 0.00014499937637577366], [0.00014770642687591057, 0.00014734566584695714, 0.00016986204775164512], [0.00014585278956254523, 0.00016964093615325432, 0.00017175358138484263], [0.00018512352238011747, 0.0001887186000284474, 0.00018814657447633517], [0.00017599468684763425, 0.0001756049813854232, 0.00017560736855517638], [0.00017526301931827627, 0.00017389517104968857, 0.00017424727858828662], [0.00017628413118021062, 0.000174675178766549, 0.00017385160520169254], [0.00017692299748541267, 0.00017563183704514678, 0.00024331466426539034], [0.00017817238245499746, 0.00024105968403726705, 0.00024357635774958567], [0.0002734819252291072, 0.0002735207167375968, 0.00027587745007645056], [0.00024343670831902304, 0.00024413704424537018], [0.0002461354037250237], 3.693548400649738e-05]
+
+    '''mobilenetv2 batchsize=32'''
+    # lats = [0.0005132594007126828, [0.0008095092558592222, 0.0002575550270319283, 0.000257324963546963], [0.0020446210390933613, 0.002046457369426016], [0.0014419660102739202, 0.0008209396214300163, 0.0008208235453007666], [0.0008193288786390398, 0.000819653533725476, 0.0008423990839264719], [0.0005791784078815255, 0.0005082552961175224, 0.00031466448262277923], [0.0005101116189968601, 0.00031522725789209777, 0.0003146892495089687], [0.00031448067055178224, 0.00031525351675938305, 0.00031451110696613567], [0.00031875131724026985, 0.0003186677662989076, 0.0003179486314107539], [0.00031848246224681486, 0.0003187337118633399, 0.00033254378728186235], [0.0003183249090431032, 0.0003331414749088216, 0.00033225732691147746], [0.000333512083013007, 0.00033369470149912734, 0.00033271745388140816], [0.00047604282746774535, 0.00047762850497631317, 0.0003095252045403434], [0.00047641343557193076, 0.00030931095605499307, 0.00030824717353372015], [0.0003089660100256546, 0.0003096329255754569, 0.0003083232645696036], [0.00028451064948892415, 0.00028558845663249715, 0.0003109718294107869], [0.00028437935515249777, 0.00031097153101456777], [0.00031179987891893066], 0.00022967169072959242]
+    '''mobilenetv2 batchsize=1'''
+    # lats = [4.387916402613863e-05, [5.971027703697004e-05, 5.319867474265928e-05, 5.327416898610446e-05], [0.0001099912335487719, 0.0001044538949099888], [8.568417593295942e-05, 8.155825141076003e-05, 8.464695067519092e-05], [8.135205962332676e-05, 8.693893203448891e-05, 8.132341358628828e-05], [8.319376108792607e-05, 8.465948331639525e-05, 8.435332879554644e-05], [8.503516415630623e-05, 8.719286721698632e-05, 8.672617553023433e-05], [8.667544817297867e-05, 8.806358738446862e-05, 8.488507085807333e-05], [9.335534593489053e-05, 9.334490206722026e-05, 9.624680529846268e-05], [9.685105764224323e-05, 9.478913976791057e-05, 9.395243676941148e-05], [9.557869616378383e-05, 9.261711368871123e-05, 9.476825203257001e-05], [9.431528657189895e-05, 9.32571735787899e-05, 9.356511847695362e-05], [0.0001039666138841154, 0.00010713349295796382, 9.967448266784898e-05], [0.00010427067963143016, 0.00010101786244646629, 0.00010026202482335707], [0.00010042763472498582, 0.00010354318964914029, 0.00010005672822458127], [0.00011450089560879933, 0.00011824457457426642, 0.00011543338379364586], [0.0001161125335884333, 0.0001147417013576541], [0.00011324643790348898], 7.248372399016226e-05]
+
+    '''resnet101 batchsize=32'''
+    # lats = [0.0012125387060478124, [0.0023419382575158034, 0.002343309686539021, 0.002422992816108637], [0.0019696421259186594, 0.001972161186800731, 0.0017322741999047271], [0.001946986392979628, 0.00179377574944526, 0.001856535337445733], [0.0025086086593074106, 0.0024036221271462373, 0.002431389685715543], [0.0012400585957552225, 0.0012236521748338683, 0.0012396515833123008], [0.0012514468874591164, 0.0012576221972144441, 0.0012512663577465301], [0.0012293440827141715, 0.0012752096703711976, 0.0012374231603476818], [0.0017848811549448101, 0.0017808951782493925, 0.0017958901850541633], [0.0009958087577390134, 0.000989048889790369, 0.0009919507930216114], [0.000990296484382639, 0.0009915575068047706, 0.0009909508672912369], [0.0010040686634813292, 0.0010732915135886105, 0.000998497307673563], [0.0009807952503686553, 0.0009740696979852134, 0.0009757213210582137], [0.0009733293769655, 0.0009756893926627645, 0.0009751293029594182], [0.0009797460892621208, 0.0010094317387281282, 0.0009956049531213334], [0.0009968101754504837, 0.0009935800363781754, 0.0009938014463727854], [0.0009784265811810357, 0.0010996786912481238, 0.0009765284828310168], [0.0009764962560393485, 0.0009755992770045809, 0.0009754760393660716], [0.0009765141598124976, 0.0009751660056943739, 0.0009754951367240973], [0.000974638441178915, 0.000977230907530898, 0.0009763166215154197], [0.000976598307546298, 0.0009770754431007204, 0.000976633518300158], [0.0009774902138453402, 0.001105259595734903, 0.0009790899159762081], [0.0009760322499185689, 0.0009770208365926158, 0.0009751060280543245], [0.000976778240466446, 0.0009777405682732077, 0.0009779789868523093], [0.0009756410524752621, 0.000976888945463751, 0.0009767436265050247], [0.0009758538089795167, 0.0009775764503526748, 0.0009775961445031387], [0.0009762614182148768, 0.0011020273678890606, 0.0009769569798017176], [0.0009775821198808386, 0.0009773607098862286, 0.000977622403370424], [0.0009770217317812732, 0.00097875183305991, 0.0009785074465564255], [0.0009765016271712933, 0.0009773457900752712, 0.001252494258188336], [0.0009783525789186863, 0.0012498525564601931, 0.001248325961403017], [0.001841047081690706, 0.0017327471579120812, 0.0017302361537279265], [0.0009103245072728851, 0.0009121211509083926], [0.0009130291706032687], 5.83919625407614e-05]
+    '''resnet101 batchsize=1'''
+    # lats = [6.745723967856549e-05, [0.00016745130469712508, 0.00015980937752467072, 0.0001633922209280155], [0.00013191649254332198, 0.00013154558604291743, 0.0001499640926700062], [0.00014063950921776, 0.00015129881895826816, 0.00015216476478624403], [0.0001701592503859194, 0.0001616409335178189, 0.00016541355691654364], [0.00014112977420582492, 0.00013261891724320317, 0.00013778087343829445], [0.00014001198196888568, 0.00013871903115130485, 0.00017047196962358954], [0.00014461593723416477, 0.00017144593488289806, 0.00016419818911594204], [0.00018398066486076956, 0.0001839075577870776, 0.00018384817693946657], [0.00017650285560884821, 0.00017721005464823583, 0.00017655447815476133], [0.00017962467685360485, 0.00017516096781132665, 0.00017897536668073252], [0.00017853314348395088, 0.00017725302370379356, 0.00017795753717720882], [0.0001852619782258035, 0.00017644616032720954, 0.0001836760023210165], [0.00017780117755837374, 0.00017657178513547209, 0.00017690479531604447], [0.00017528599582715087, 0.00017581982666321183, 0.0001793934197837629], [0.00018016775797245947, 0.00017837529188402006, 0.0001760472045822048], [0.00017404854670633214, 0.00017549099402970755, 0.00017199826628454636], [0.0001784952471641187, 0.00017298864333590818, 0.0001755270999722248], [0.0001763984169321454, 0.0001783526137713646, 0.00017843974546735664], [0.00017859491150131512, 0.00017367018030044882, 0.0001768609310718293], [0.00018081438257935945, 0.0001750234071542981, 0.0001799979705237626], [0.0001789893913030326, 0.0001782917409426578, 0.00017902728762286477], [0.00017893747036090035, 0.00017776954755914376, 0.00017821445632189775], [0.00018316276082407698, 0.00017251717730964975, 0.00017595619373536378], [0.0001844709298488345, 0.00017791158415945957, 0.0001776537698261132], [0.00017764929388282594, 0.00017245093334899826, 0.0001755312775192929], [0.00018080901144741475, 0.00017721482898774225, 0.00017679737267715015], [0.0001791875263925488, 0.00017300953107124873, 0.00017629905099116817], [0.0001804616782483231, 0.00017805332236355624, 0.0001727952825858984], [0.00017724944294916374, 0.00017389367906859283, 0.00024357993850421548], [0.00018218252924416629, 0.000244571807536673, 0.0002434152237912442], [0.00027772571625787114, 0.0002710240355719613, 0.0002744734958653456], [0.0002449110840378476, 0.00024109907233819497], [0.00024432682424075015], 3.707006070133443e-05]
+
+    '''pruned mbv2 batchsize=1'''
+    # lats = [5.465425149967733e-05, [6.0817625406239e-05, 5.390348661229369e-05, 5.362866369445572e-05], [0.00011201376312217664, 0.00011242793707435809, 0.00010936221431880183, 8.632751818144873e-05], [0.00010770581690629523, 0.00011300682573951082, 0.00011025173344809063, 8.824202832352086e-05, 9.183442040587845e-05], [0.00011125762710284828, 0.00011310082054854335, 0.0001118275638814265, 8.697682835432108e-05, 8.729074117686782e-05], [0.00010180383808770973, 9.990484454903346e-05, 0.00010261517740758101, 9.015355450340146e-05, 8.840913020624535e-05], [0.00010365210426913036, 0.00010534639800146912, 0.00010483136612721469, 9.22891762438644e-05, 9.041793355356916e-05], [0.00010477347726069941, 0.00010556034809060032, 0.00010192110780183604, 8.441509681291067e-05, 8.446463058528972e-05], [0.00011095206937443777, 0.00011245419594164337, 0.00011288776564806961, 0.00010002629181022787, 9.471513750556115e-05], [0.00011173416586483226, 0.00011098101380769541, 0.00011544830360460341, 0.00010164777686509382, 8.870543765186219e-05], [0.00011099981276950191, 0.00011433618089582803, 0.00011300473696597676, 0.0001054383040369676, 9.045881383559284e-05], [0.00011343860506862215, 0.00011337325629662811, 0.00011377668798492012, 0.00010721674550310692, 8.771714937403444e-05], [0.00011867814428069266, 0.0001189422249346412, 0.00012572745656191334, 0.00011185024199408195, 0.0001099085777960671], [0.00012019190830044514, 0.00012529090289329557, 0.00012629590135939577, 0.00011190216293621422, 0.00010994796609699503], [0.00012686494294931653, 0.000125683293921479, 0.00012517989949977144, 0.00011275080178347935, 0.00010476004943083762], [0.00013877065369721797, 0.0001387685649236839, 0.00015048718124217772, 0.00013444957804769389, 0.0001163658719784924], [0.00013711783703934118, 0.00014794454705879296, 0.00013452686266845397, 0.00011545486832142473], [0.00014994439851954226], 7.47718261986113e-05]
+    '''pruned mbv2 batchsize=32'''
+    lats = [0.0005128383636474609, [0.0008096253319884719, 0.0002576338036337842, 0.0002562483499882666], [0.0020460315580212874, 0.002047975907785275, 0.001189825681034704, 0.0005990489105110026], [0.001441368024250742, 0.0008203959435187234, 0.0008201763239014283, 0.0008703820845660041, 0.0004651886649961316], [0.0009399779299472241, 0.0008234366009918709, 0.0008249088879371615, 0.0004969117638465013, 0.00025370004627671796], [0.0005116722312230193, 0.000511143771518903, 0.0003153239382671027, 0.0003188432232757683, 0.00016686286735295952], [0.0005112637267990017, 0.0003152675413816832, 0.0003155122262813869, 0.0003196993220285122, 0.00016780192025462736], [0.0003158246471228379, 0.00031524486326902767, 0.0003163713089963223, 0.0001982487784756886, 0.0001059249882704027], [0.00033935050343691334, 0.0003421097732754016, 0.0003402048118123423, 0.00019486884450136647, 9.340189574507808e-05], [0.0003407684822703184, 0.00034140048546247995, 0.00035122697135533796, 0.00019531255967924382, 9.356869923158342e-05], [0.00034081712085404, 0.0003490779217850133, 0.0003469452840067418, 0.00019544594278920427, 9.413177289712115e-05], [0.000346425477792981, 0.00034846113680002833, 0.0003495941472441443, 0.00019966675730909365, 9.570790172667617e-05], [0.0004755612159700358, 0.0004747874745737775, 0.000308814424746326, 0.00030619331235730453, 0.00022344535522078992], [0.00047731638253108134, 0.00030911043379572365, 0.0003096120378401163, 0.0003046708948471967, 0.00014566927588776743], [0.0003091662338887049, 0.00030812602466874484, 0.00030947328359821115, 0.00020431069766773898, 0.00010326389078801505], [0.0002940190450121673, 0.0002992684312994698, 0.00033143136617686783, 0.00018520528294416482, 0.00011009925298010452], [0.0002991959210182161, 0.00032219659998658604, 0.00018136701237722692, 0.000135159761049273], [0.0003390285339164495], 0.0002347703869262237]
+
+    '''mobilenetv2_120d'''
+    # lats = [0.0005101435473923092, [0.0008569214311201075, 0.00026926946580335405, 0.000271571294237884], [0.0031034683852977536, 0.003209287144514139, 0.0031802406597495527], [0.0019109508719700895, 0.0019974284834497714, 0.0011000003623723685], [0.0019857024072257984, 0.001073320159625649, 0.0011030571332413502], [0.0010885562705754935, 0.001082290248369544, 0.0010756455613614919], [0.0006419535124853943, 0.0006495939476767529, 0.0006806814625803312], [0.000660982836173085, 0.0006463503807745827, 0.0006449159901491244], [0.0006445826815723328, 0.0006444397497833595, 0.0003959589517758098], [0.0006443365046915334, 0.0003959568630022758, 0.0003967485081716831], [0.0003963158336539143, 0.00039673687071913624, 0.0003966855465694423], [0.00040986630436177547, 0.00040876253674713633, 0.0004099671622838485], [0.0004104956219879647, 0.0004095141968231774, 0.00041045086255509205], [0.00041185332478510127, 0.0004105284455720713, 0.00041076149301922814], [0.0004108065508483199, 0.00040954791559594147, 0.0004230584012104364], [0.00040934858692154866, 0.00042291397744036733, 0.0004232189383763396], [0.0004228951784785608, 0.00042329025507271663, 0.00042344213874826445], [0.0005762902308763641, 0.0005776198844289004, 0.0005772206302876765], [0.0005779054496106278, 0.0005779042560257512, 0.0005784473371446058], [0.0005772095896275679, 0.0005768470382212996, 0.00036728426870028577], [0.000576517608795357, 0.00036776677538665273, 0.00036688590974771933], [0.00036800250839978194, 0.000366416532494995, 0.00036692708842596216], [0.00033858959307807854, 0.0003367329718025217, 0.00033816616884310344], [0.0003390706077833498, 0.00033822375931339955, 0.0003385170827968249], [0.00033875430779104984, 0.0003376263700826595, 0.000368396093012842], [0.00033912372231035865, 0.0003679613297215391], [0.0003686261564978073], 0.0002701369036124257]
+
+    '''mobilenetv2_140'''
+    # lats = [0.0007602130068706183, [0.001198944072699517, 0.0003665215679641361, 0.0003667480506944716], [0.003097292777146207, 0.003094214223353227], [0.0018848030080783353, 0.0010729689472757085, 0.0010742923345076426], [0.0010741413460207522, 0.0010756345207013833, 0.0010748610777013441], [0.000760849187609848, 0.0007634846230173887, 0.000467609851918322], [0.0007639868238542197, 0.00046701276108380106, 0.00046645863930483785], [0.0004667254055247587, 0.00046650817307721686, 0.0004667641970332483], [0.00044235628149536286, 0.0004420626596157184, 0.0004423491199861032], [0.0004433806757157079, 0.00044255083583024925, 0.0004724913156674114], [0.0004423917906454418, 0.0004722355901075991, 0.000474098179307539], [0.0004731761349903627, 0.0004749020587219315, 0.0004729615881087932], [0.0007296766297838118, 0.0007292651413976027, 0.00045102379647303883], [0.0007305921093841667, 0.0004512019390158719, 0.0004508220806288928], [0.00045112674316864586, 0.00045120760854403577, 0.0004511273399610842], [0.00040133664843734724, 0.00040132918853186847, 0.0004671920972115107], [0.00039930337660005306, 0.0004672473005120536], [0.00046558254800541083], 0.0003732435395929482]
+    '''resnet50_pruned'''
+    # lats = [0.0012107256506202516, [0.002340228745576288, 0.0023421936846793967, 0.0023411752583834345, 0.002315236271845086, 0.0021635850469520004], [0.001931271057701827, 0.0019312707593056079, 0.0017338237714707777, 0.0018985357988760975, 0.001741643841186065], [0.0019373237266110837, 0.001739517768124615, 0.0017423778958851762, 0.0019059020079420564, 0.001746536345595263], [0.0023982289138813045, 0.0023989050797139, 0.0024029913175389523, 0.002350334231934052, 0.002146421296426441], [0.0012318497157663816, 0.001231300666723144, 0.0012320851503832917, 0.0011656812493583287, 0.0010526344385254518], [0.0012334562810102899, 0.001233504024405354, 0.0012177358729967636, 0.0011664346998116848, 0.0010504030315986413], [0.0012318694099168455, 0.0012204217373653406, 0.0012176570963949077, 0.0011686986319263827, 0.0010531067997403675], [0.0017630134864205563, 0.001763076149626578, 0.0017618216919212675, 0.0017826942090546532, 0.0015508564601702446], [0.0009761626490663378, 0.0009764595533043929, 0.0009774075580926353, 0.0008897820163578802, 0.0007396743951064625], [0.000977064700836831, 0.0009782460514684494, 0.0009771950999846, 0.0008903573242684031, 0.0007400244138715264], [0.0009785113257072746, 0.0009784361298600483, 0.0009780989421324078, 0.0008878155852736758, 0.0007400864802851098], [0.0009763202022700495, 0.0009782126310919044, 0.0012523623670594713, 0.0008884440077112076, 0.0007417369097732334], [0.0009769617541412238, 0.0012532999279800433, 0.0012524417404537655, 0.0008892431127860937, 0.0007426986407875567], [0.0017276499536965457, 0.0017302218307094072, 0.001729481808085913, 0.0017035562493774262, 0.0013076256452424356], [0.0009138903420917382, 0.0009135659854015212, 0.000795855838455754, 0.0006053552162065375], [0.000917469306344234, 0.0007958812021343818, 0.0006032157153152256], 5.891534950915206e-05]
+
+    '''effiv2_m'''
+    # lats = [0.00038650665474176704, [0.0011113683631333601, 0.0012367281955532794, 0.001235392275680141], [0.0011213070460046187, 0.001232534833485552, 0.00037679654337437787], [0.0011088415439495904, 0.0003761188855606862, 0.0003762671884816042], [0.0008411019555618228, 0.0009709448927782653, 0.0009724544792509497], [0.0016751331143146462, 0.0018920611977129615, 0.0018918036817758342], [0.00167908179148267, 0.0019809370196059587, 0.001897674328991409], [0.0016774570240693934, 0.0018950308368859512, 0.0006060033327945332], [0.001682979442897219, 0.0006062187748647602, 0.0006094811407287369], [0.0005503220015085385, 0.0006084648032063089, 0.0006077990812413833], [0.0007400808107569459, 0.0008177199262253781, 0.0008162947858827135], [0.0007505058794654207, 0.0008653931981780203, 0.0008161315631508379], [0.0007395633917129383, 0.000819635928348546, 0.0003114993939262457], [0.0007428958806884155, 0.00031287529889275045, 0.0003117569098633729], [0.0005597447573168853, 0.0006667806747111868, 0.000666808723955787], [0.0006161589497171146, 0.0006991903832618226, 0.0007010971351021968], [0.0006180081110871927, 0.0006982071677197204, 0.0007009753894447832], [0.0006205435837613178, 0.000701101611045484, 0.0007020176874382773], [0.0006187767797477254, 0.0007006516295470045, 0.0007453436248741102], [0.0006599303927081399, 0.000703320186934871, 0.000703945028617773], [0.0006182235531574197, 0.0007028481241161743, 0.000729226051492894], [0.0006194320578449808, 0.0007278411946398147, 0.0007304288866522912], [0.0008435422398420389, 0.0009623325811011323, 0.0009623901715714284], [0.0010379342471852021, 0.0011820178455644018, 0.0011817722654760407], [0.0010381804240660016, 0.0011868936397853274, 0.001251960427352275], [0.0010389944489518452, 0.0011812811052993183, 0.0011822541753699694], [0.0010386650195259028, 0.001182429930743049, 0.0011827190766794064], [0.0010393143296987752, 0.0011831899459132265, 0.0011832236646859904], [0.0010400057137385477, 0.0011834444778881623, 0.0011912239657176451], [0.0011151418817207423, 0.0011835384726971948, 0.0011828142650733154], [0.0010399651318527433, 0.0011839251941972143, 0.0011843829339973917], [0.001040431226747057, 0.0011838568614630288, 0.0011835345935463457], [0.001040188332224668, 0.0011843468280548744, 0.001184533624088063], [0.0010402381643932663, 0.001305724264534006, 0.0011823054995196633], [0.0010405526740082513, 0.0011838840155189714, 0.0011844617105992476], [0.001040876732302249, 0.001184699532385911, 0.0007462722339081078], [0.001040043908454599, 0.0007443836842371018, 0.0007451801037460155], [0.0006565065944896025, 0.0007458386642016816, 0.0007460132259898848], [0.000719870434833856, 0.000828091880406844, 0.0008518113958671484], [0.0007213260115908741, 0.0007902624013277705, 0.000791402274884927], [0.0007227830803289879, 0.0007914115251677206, 0.0007903465490615711], [0.0007207432437748724, 0.0007929512496585392, 0.0007917731813853315], [0.0007194091142790487, 0.0007902767243462898, 0.0007909773586688561], [0.0007219413045947632, 0.0007901701968960529, 0.0007905291675476914], [0.0007211111663130855, 0.000791983849116052, 0.0008068404000751366], [0.0008040829206139632, 0.0007903125318925879, 0.000791886870344828], [0.0007220737925160663, 0.0007892571044654512, 0.0007907079068829628], [0.0007350325435213511, 0.0007941943683075219, 0.0007917961578942062], [0.0007201348138840237, 0.0007910889588548185, 0.0007923171576928435], [0.0007216073992255334, 0.000790714173203565, 0.0007908770975392214], [0.0007212725986676461, 0.000792557068253041, 0.0007911734049848382], [0.000719500423522109, 0.0009052156656048026, 0.0007916263704455093], [0.0007231614467348713, 0.0007903707191553223, 0.0007903337180241476], [0.0007224384326958687, 0.0007923368518433075, 0.0007902480783092513], [0.000720528696893303, 0.0007912715773409389, 0.0007921011188301784], [0.0007223319052456317, 0.0007927814622098423, 0.0007903668400044733], [0.0007222758067564314, 0.00079121846281393, 0.0007912241323420939], [0.0007220964706287217, 0.0007919131292121133, 0.0008993414376345982], [0.000722983005795819, 0.0007924415889162295, 0.0007926641924957161], [0.000720590166514448, 0.0007933039539895756], [0.0007231733825836372], 0.00031037623055736173]
+    # infos = [(83.30000030517579, 0.05286938854690191), (84.20000006103515, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 99, 0, 0, 1, 99, 0, 0, 0, 0, 0, 1, 99, 0, 0, 0, 1, 99, 0, 0, 1, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 99], 0.04842058529095896, 84.20000006103515), (83.70000067138672, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 99, 1, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 99, 99, 0, 0, 0, 2, 99, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 99], 0.04738572870237808, 83.70000067138672), (83.50000048828124, [0, 0, 0, 0, 0, 0, 0, 0, 2, 99, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 99, 99, 0, 0, 0, 1, 99, 0, 0, 2, 99, 99, 0, 2, 99, 99, 0, 0, 2, 99, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0.044541430562846526, 83.50000048828124), (83.20000030517578, [0, 0, 0, 0, 0, 1, 99, 0, 0, 0, 1, 99, 0, 0, 0, 1, 99, 0, 2, 99, 99, 0, 0, 1, 99, 0, 0, 0, 2, 99, 99, 1, 99, 1, 99, 1, 99, 0, 0, 2, 99, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 99], 0.04146327960476262, 83.20000030517578), (83.20000048828125, [2, 99, 99, 1, 99, 0, 0, 0, 1, 99, 1, 99, 0, 0, 1, 99, 1, 99, 0, 1, 99, 2, 99, 99, 0, 0, 0, 0, 1, 99, 1, 99, 1, 99, 0, 0, 2, 99, 99, 0, 0, 0, 1, 99, 0, 0, 0, 1, 99, 0, 0, 0, 0, 0, 0, 0, 1, 99, 1, 99], 0.03774384085615825, 83.20000048828125), (82.10000012207031, [0, 1, 99, 1, 99, 0, 1, 99, 1, 99, 1, 99, 0, 0, 1, 99, 1, 99, 0, 1, 99, 1, 99, 2, 99, 99, 0, 1, 99, 0, 1, 99, 0, 1, 99, 0, 2, 99, 99, 1, 99, 1, 99, 0, 1, 99, 0, 1, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 99], 0.03570559206832485, 82.10000012207031), (81.90000030517578, [2, 99, 99, 1, 99, 2, 99, 99, 1, 99, 0, 0, 0, 0, 1, 99, 2, 99, 99, 0, 0, 1, 99, 2, 99, 99, 2, 99, 99, 0, 0, 0, 0, 2, 99, 99, 2, 99, 99, 0, 2, 99, 99, 1, 99, 0, 2, 99, 99, 0, 0, 0, 0, 0, 0, 1, 99, 0, 0, 0], 0.031437355824495576, 81.90000030517578), (81.2000005493164, [2, 99, 99, 2, 99, 99, 0, 0, 1, 99, 2, 99, 99, 2, 99, 99, 1, 99, 2, 99, 99, 0, 2, 99, 99, 0, 2, 99, 99, 0, 2, 99, 99, 0, 2, 99, 99, 0, 1, 99, 0, 0, 1, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 99, 99, 1, 99], 0.03137629411098208, 81.2000005493164), (81.10000048828125, [2, 99, 99, 1, 99, 2, 99, 99, 1, 99, 1, 99, 0, 1, 99, 2, 99, 99, 1, 99, 1, 99, 1, 99, 2, 99, 99, 2, 99, 99, 2, 99, 99, 0, 0, 0, 0, 1, 99, 0, 0, 2, 99, 99, 0, 0, 2, 99, 99, 0, 0, 1, 99, 0, 0, 2, 99, 99, 1, 99], 0.028972657064024878, 81.10000048828125), (80.60000012207031, [2, 99, 99, 1, 99, 2, 99, 99, 2, 99, 99, 1, 99, 0, 0, 2, 99, 99, 2, 99, 99, 2, 99, 99, 2, 99, 99, 0, 0, 0, 2, 99, 99, 2, 99, 99, 1, 99, 2, 99, 99, 2, 99, 99, 1, 99, 0, 0, 0, 2, 99, 99, 0, 0, 2, 99, 99, 0, 1, 99], 0.026353006816477287, 80.60000012207031)]
+    # resized:
+    # lats = [0.001259028240199083, [0.0038807150419423817, 0.0043725534732708795, 0.0042540391485145004], [0.0038987775618800234, 0.004407475081194327, 0.0012285443808468471], [0.003918619120076243, 0.0011731820351191247, 0.0011884951322935103], [0.0027609104209011877, 0.0031779522591448843, 0.0031808198468109244], [0.005871956876580498, 0.0066341533231198116, 0.006750379545667742], [0.005864866087224815, 0.006563105183339984, 0.0066709813844874144], [0.005871068849432304, 0.006568339948212549, 0.002393217349380665], [0.00586712405141513, 0.002392619363357487, 0.002392519102227852], [0.002234912783989172, 0.0023952750897079295, 0.0023953675925358665], [0.0024286554811594635, 0.002683583427877987, 0.0026839358338128045], [0.002425117397188991, 0.002675506439018011, 0.002679752915612747], [0.0024261817765027023, 0.002680076675510526, 0.000973107668574671], [0.002422356038576969, 0.0009731706301769118, 0.0009744203135427157], [0.001660326693920379, 0.0019959582852780147, 0.002000930759873945], [0.0018251649429263997, 0.002079867600499465, 0.002080541975954746], [0.001823668485887358, 0.0020805252657664732, 0.002078909151843552], [0.001822658116289313, 0.0020787110167540357, 0.0020802307486981714], [0.001822800152889629, 0.0020872272448486024, 0.0020784693158165234], [0.0018208441656730949, 0.0020787754703373725, 0.0020770692407562678], [0.0018226989965713367, 0.0020783860632713805, 0.002016813793826909], [0.0018196992193802127, 0.0020398341669457427, 0.0020974735742218054], [0.002599000930786133, 0.002977489380723096, 0.0029766413386682696], [0.003322480766286838, 0.0037971512695427084, 0.0037910899471430962], [0.0033159100815411354, 0.0037907775263016454, 0.0037924762959772713], [0.003316118362102103, 0.003791415199021971, 0.003790592520645772], [0.0033159661800303357, 0.0037925858073896996, 0.0037912642105350806], [0.0033151730428798327, 0.0037926153486153957, 0.00379091299818514], [0.003315851297485963, 0.003791237951667795, 0.0037914181829841625], [0.0033150694993917874, 0.003790142240751073, 0.0037915038226990585], [0.0033153323864608592, 0.00379170016741126, 0.003789867119437016], [0.003316012133048085, 0.0037903350047086446, 0.003790580584797006], [0.0033135193310332984, 0.0037910210176164724, 0.003790095094148447], [0.0033171269413228327, 0.0037898936767005206, 0.0037907960268672328], [0.0033155406670218267, 0.0037912880822326125, 0.003791014452899651], [0.003316023472104413, 0.003790828850451339, 0.0021568809790963373], [0.0033163567806812045, 0.0021569284240951824, 0.0021566956750442446], [0.0018638764812292832, 0.0021567365553262683, 0.0021573616954053895], [0.0019055952566287694, 0.002119309911143049, 0.0021215102848630672], [0.0019061774276523328, 0.002120920355537806, 0.0021207574312021495], [0.0019065086474555903, 0.0021214509040154562, 0.0021204118883803727], [0.0019068437464096967, 0.002120340870080215, 0.00212049364894442], [0.0019053604188042977, 0.002120172574612614, 0.0021205028992272138], [0.0019053440070122443, 0.002120874700916276, 0.0021203853311168685], [0.0019050778375847618, 0.0021200233765030383, 0.0021209472111975297], [0.0019053311759748208, 0.002120909911670136, 0.0021208523211998396], [0.001905115733904594, 0.0021202191244228015, 0.002120957953461419], [0.0019056295721939717, 0.0021206156929980528, 0.0021200723134829793], [0.001905867692376854, 0.002120499616868803, 0.002121098796476858], [0.0019061031269937642, 0.002120621959318655, 0.0021208183040308565], [0.0019064531457588282, 0.0021206425486577766, 0.0021212536641145975], [0.0019049799636248802, 0.002121618005898181, 0.0021414574753208663], [0.001916364376177925, 0.002138625098408686, 0.0021307178969974063], [0.0019094955936092906, 0.0021256114424990772, 0.002125036134588554], [0.0019091631802211565, 0.002121445831279731, 0.0021222774615425044], [0.0019060497140705361, 0.0021216952905189408, 0.002121745421083758], [0.0019057534066249193, 0.002121509986466848, 0.002122156312677529], [0.0019066205460377718, 0.002122557655592287, 0.0021211408703437585], [0.001905358926823202, 0.002120366233758843, 0.00212090483893441], [0.0019061141676538728, 0.002120773842994203], [0.001905932742752629], 0.000819264126659484]
+
+    '''effiv2_s'''
+    # lats = [0.00032893677378476635, [0.0008414203443276568, 0.000949669839145245, 0.00031470118535773477], [0.0008597293395423173, 0.0003153704880772902, 0.00031250827154319485], [0.0006483350140281554, 0.0007296682746896756, 0.0007400775283985353], [0.0013995498829102785, 0.0015801353955895493, 0.0015794186478711488], [0.0014073630895125254, 0.0015831354711768923, 0.0004711947840952008], [0.0014027734572657656, 0.00048092996074499864, 0.00047866662542273914], [0.00042188421208807765, 0.00048047520490701265, 0.00047995390671215607], [0.0005153066971722771, 0.0005890320478303263, 0.0005943998974166316], [0.0005316218088505713, 0.000592482403312368, 0.00024943417392773683], [0.0005156262795229877, 0.0002604808019607028, 0.00024970959363801307], [0.00044377873627205513, 0.0005273407182944135, 0.0005351906276316159], [0.0005040488046161522, 0.0005686584491753608, 0.0005767593097328692], [0.0004971379481806176, 0.0005779508058359387, 0.0005776789668802923], [0.000496749137907064, 0.0005774674039609143, 0.0005790584526014268], [0.00049613205452586, 0.000574314549509366, 0.000580981019441416], [0.0005059627179657861, 0.0005884486832218863, 0.0005814354768831828], [0.0007208557391494923, 0.0008075326793035668, 0.0008232778542032826], [0.0008958325964936028, 0.001015091419816763, 0.0010254550189040927], [0.0008932389365567433, 0.001016220252713811, 0.001024306491856581], [0.000886293167763568, 0.0010170966424094571, 0.001026060763228969], [0.0009769510118773344, 0.0010205270053448158, 0.0010266136914230558], [0.000889649230040358, 0.0010181914581375217, 0.0010270556162236182], [0.0008869505346343574, 0.0010184573291687853, 0.0010240841866733135], [0.0008871340483091352, 0.0010177874296567915, 0.0006193992342608742], [0.0008985232352016864, 0.0006208070676228281, 0.0006187218748434016], [0.0005247867450547009, 0.0006192043815297687, 0.000636176263286414], [0.0005794824736288402, 0.0006363585833763151, 0.0006285990880935153], [0.000580316491061367, 0.0006286915909214521, 0.0006367324738389112], [0.0005803182814386818, 0.0006359178521606292, 0.0006366238576151403], [0.0005719088791905715, 0.000635723596221962, 0.0006298621992891811], [0.0005803722911543482, 0.0006361452300796222, 0.0006291093456282634], [0.000580567740677892, 0.0006282251976309193, 0.0006370117727000364], [0.0005799226080520878, 0.0006371072594901647, 0.0006354508620776581], [0.0005715373758977286, 0.0006352169194418438, 0.0006566456471277268], [0.0006564928682635216, 0.0006355699221690993, 0.0006379260587155148], [0.0005798116046585637, 0.0006284853991340188, 0.00063902415680199], [0.0005711667677935432, 0.000638385290496788, 0.0006356093104700273], [0.0005721711694672051, 0.0006424476566243082, 0.0006412877905204687], [0.000590002432335005, 0.0006462044650234179], [0.0005764516632309247], 0.00024830981697397626]
+    # infos = [(83.00000042724609, 0.028695404007378144), (83.40000024414063, [0, 0, 1, 99, 0, 2, 99, 99, 0, 0, 0, 2, 99, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0.02459471306305504, 83.40000024414063), (83.40000024414063, [0, 0, 0, 0, 1, 99, 0, 0, 0, 0, 0, 0, 2, 99, 99, 0, 0, 0, 2, 99, 99, 0, 1, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0.024068258879927723, 83.40000024414063), (82.80000030517579, [0, 0, 0, 2, 99, 99, 0, 0, 1, 99, 0, 1, 99, 0, 0, 0, 0, 1, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 99, 0, 0, 0, 0, 0, 0, 0, 0, 1, 99], 0.023367303184633405, 82.80000030517579), (82.70000006103515, [0, 0, 0, 2, 99, 99, 0, 0, 0, 0, 1, 99, 0, 0, 0, 0, 1, 99, 0, 1, 99, 0, 0, 0, 0, 2, 99, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0.022940936762937462, 82.70000006103515), (82.00000067138672, [0, 0, 0, 2, 99, 99, 0, 0, 1, 99, 0, 0, 1, 99, 1, 99, 0, 1, 99, 0, 2, 99, 99, 0, 1, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0.02146323392626938, 82.00000067138672), (81.29999993896485, [0, 0, 0, 1, 99, 0, 2, 99, 99, 1, 99, 1, 99, 0, 1, 99, 0, 0, 2, 99, 99, 1, 99, 1, 99, 1, 99, 0, 0, 2, 99, 99, 0, 0, 0, 0, 0, 0, 1, 99], 0.019553778914545884, 81.29999993896485), (80.80000024414062, [0, 2, 99, 99, 0, 2, 99, 99, 0, 2, 99, 99, 2, 99, 99, 2, 99, 99, 1, 99, 1, 99, 1, 99, 0, 1, 99, 0, 0, 0, 0, 1, 99, 0, 0, 0, 0, 0, 0, 0], 0.017189357993898167, 80.80000024414062), (79.20000018310547, [0, 1, 99, 0, 1, 99, 1, 99, 1, 99, 2, 99, 99, 1, 99, 0, 2, 99, 99, 2, 99, 99, 1, 99, 0, 2, 99, 99, 2, 99, 99, 1, 99, 0, 0, 0, 0, 0, 0, 0], 0.017193279517010242, 79.20000018310547), (78.00000018310547, [0, 2, 99, 99, 0, 2, 99, 99, 2, 99, 99, 2, 99, 99, 1, 99, 1, 99, 2, 99, 99, 0, 1, 99, 1, 99, 2, 99, 99, 2, 99, 99, 0, 0, 0, 0, 0, 2, 99, 99], 0.014237146055295562, 78.00000018310547), (78.70000030517578, [0, 2, 99, 99, 2, 99, 99, 2, 99, 99, 2, 99, 99, 1, 99, 0, 2, 99, 99, 2, 99, 99, 2, 99, 99, 2, 99, 99, 1, 99, 0, 1, 99, 0, 0, 0, 0, 0, 1, 99], 0.013366889297141603, 78.70000030517578)]
+    # resized
+    # lats = [0.0008677687304786806, [0.0024874538593507084, 0.0029074411666736434, 0.0007878224154437738], [0.002540279837215648, 0.0008012985854930662, 0.0008118850865561016], [0.0017822472115183651, 0.0020680794578619086, 0.0020475402493053147], [0.003779271964883625, 0.004280934196539009, 0.00436087543883819], [0.003851539351614903, 0.00429824475800439, 0.001369357556664153], [0.0037983081516843563, 0.0013699206303296907, 0.0013688105963944493], [0.0012464380085244495, 0.0013700829578729087, 0.0013713696423698874], [0.0013804029911122424, 0.0015618099885828355, 0.0015615963368899235], [0.001380343013472193, 0.0015636851104239796, 0.0005307218458536121], [0.0014016705848397838, 0.0005285572796798916, 0.0005290905137235142], [0.0010943472460005549, 0.0013527789611243485, 0.0013191207627927853], [0.0011753865863862116, 0.0013611668788446802, 0.0013829023578438501], [0.0011931701058589472, 0.0013906478285043498, 0.0013698343938223561], [0.001175784945338778, 0.001357193733186686, 0.001366158152402417], [0.001167317355827933, 0.0013581772471250074, 0.0014606951473651452], [0.0011667536853699572, 0.0014600491195506835, 0.0014603024579407425], [0.0018238851215424616, 0.0020919365339792414, 0.002090637316841059], [0.00230232705461218, 0.0026435508895129227, 0.0026436869581888556], [0.002304427763995002, 0.002644834888443929, 0.0026454913601260607], [0.0023039240711770757, 0.0026448441387267227, 0.0026449053099516485], [0.00230397867768518, 0.002644409673831639, 0.0026452377233397825], [0.002305599565947608, 0.0026483320921323775, 0.0026465211254783506], [0.0023051343662419516, 0.00264628240850303, 0.002647878828275487], [0.0023050943811485855, 0.0026470665937669583, 0.0014984923996525503], [0.0023306385894889974, 0.0015039787125378586, 0.0015031542437843447], [0.0012818063155879665, 0.001500910005820111, 0.0015009941535539114], [0.0012922406345792347, 0.0014452626917030994, 0.0014467681006287156], [0.001292072935904072, 0.0014444958134198816, 0.001443519759387039], [0.0012890015436203518, 0.001447049786659594, 0.001458831961372767], [0.0012918598810035982, 0.0014476785074933449, 0.0014457219234843726], [0.0012907277657481398, 0.0014483400519112026, 0.0014564003305829064], [0.0012922901683516139, 0.0014449956270869593, 0.0014452379248169097], [0.0012905394777338556, 0.0014546669469458588, 0.001447672837965181], [0.0012943622316973977, 0.0014470429235465536, 0.0014423076739448482], [0.0012880920319443799, 0.001441985406028165, 0.001441831135182864], [0.0012869972162163153, 0.0014412322539710282, 0.001441536319718343], [0.0012872648776248938, 0.0014419364690482243, 0.001441304764252282], [0.0012882985221280324, 0.0014416386696215117, 0.0014453638480213915], [0.001310770741392286, 0.001454341098274546], [0.0013173447084963994], 0.0005380328516190281]
+
+    '''effiv2_t'''
+    # lats = [0.0005104541778564453, [0.0010713692451448404, 0.0010758765200351147], [0.0010638204175927612], [0.0010175161874935834, 0.0011599899382704639, 0.0011671759160200555], [0.0017933353166257931, 0.0020534866891605535, 0.0020519624812731308], [0.0018062269284817693, 0.0020590276085539665, 0.0006740809382127134], [0.0018180407331941722, 0.0006743110016976787, 0.0006845042165438732], [0.0006047515606551952, 0.0006793891085551886, 0.0006781641920755742], [0.0006289428405379772, 0.0007119017638014315, 0.0007115174294711652], [0.0006291075552509485, 0.0007103748703480363, 0.000243052970781195], [0.0006306228112517967, 0.0002451157838441851, 0.0002439947092488352], [0.0004815995618607732, 0.0005861683393151351, 0.0005858326435685903], [0.0005757044790981708, 0.0006679214434570006, 0.0006697795567136533], [0.0005772883662294238, 0.0006684039501433677, 0.0006704831749984111], [0.0005764450985141033, 0.0006697521042614914, 0.0006722902625015889], [0.0005767363332239946, 0.0006695497916249071, 0.000657990817283659], [0.0005764531552120204, 0.0006610517656997089, 0.0006620880957688199], [0.0008416486174353073, 0.0009738915554423804, 0.0009741989035481058], [0.0009665796544883069, 0.0011270255111484266, 0.0011294738521265596], [0.0009681868165246537, 0.0011310917564267956, 0.0011301070489035977], [0.0009778629107230596, 0.001131468332455364, 0.0011326371504457782], [0.0009719558591687486, 0.0011326255129932312, 0.00113083722445186], [0.0009716914801185809, 0.0011316467733944163, 0.0011381750858769995], [0.0009724323979307325, 0.0011324276762999343, 0.001134568967568561], [0.0009711600364522732, 0.0011332115631676437, 0.000727652011436873], [0.0009703612297736062, 0.0007287987481070699, 0.0007288211278235062], [0.0006267615641759841, 0.0007259747262890259, 0.0007246012084922743], [0.0006458732452201604, 0.0007193449590919313, 0.0007213024382895612], [0.0006473285235809594, 0.0007194747614472619, 0.0007204564850082684], [0.0006482308737476716, 0.0007202792376540928, 0.0007211204165958791], [0.0006456861507907528, 0.0007191832283411515, 0.0007215942697918907], [0.0006515192000827144, 0.0007209989693346847, 0.0007205630124585053], [0.0006473685086743256, 0.000720918402355514, 0.0007199536873789992], [0.0006490407210864472, 0.0007202493980321777, 0.0007202822216162843], [0.000652856910333168, 0.0007211007224454151, 0.0007189997146663737], [0.0006475657485751843, 0.0007229325768347825, 0.0007210929641437172], [0.0006477913361168624, 0.0007227980001399454, 0.0007226640202375467], [0.0006484737682700605, 0.0007239137036033507, 0.000723673196250715], [0.0006478128206446412, 0.0007221334717598964], [0.0006482938353499125], 0.00022256508637429477]
+
+
+    loss_fn = nn.CrossEntropyLoss()
+    if args.GPU:
+        # originalmodel.cuda()
+        loss_fn.cuda()
+    if 'v2_rw_m' in args.model:
+        print('-------------v2m--------------')
+        imagesize=416
+    elif 'v2_rw_s' in args.model:
+        print('-------------v2s--------------')
+        imagesize = 384
+    elif 'v2_rw_t' in args.model:
+        print('-------------v2t--------------')
+        imagesize = 288
+    else:
+        imagesize = 224
+    data_transform = transforms.Compose([
+        transforms.Resize(imagesize),
+        transforms.CenterCrop(imagesize),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                            std=[0.229, 0.224, 0.225])
+    ])
+    dataset_eval = torchvision.datasets.ImageFolder(root=args.data_dir,transform=data_transform)
+
+    if args.test_effi:
+        loader_eval = torch.utils.data.DataLoader(dataset_eval, batch_size=args.batch_size, shuffle=False, num_workers=16)
+        baseline_subnet = model.generate_random_subnet()
+        baseline_subnet = [0 for _ in range(len(baseline_subnet))]
+        baseline_acc, baseline_latency = validate(model, loader_eval, baseline_subnet, args, loss_fn, lats)
+        accs, latencys = [baseline_acc], [baseline_latency]
+        for i in range(1, len(infos)):
+            subnet = infos[i][1]
+            acc, lat = validate(model, loader_eval, subnet, args, loss_fn, lats)
+            accs.append(acc)
+            latencys.append(lat)
+        print(accs, ',', latencys)
+        exit(0)
+
+    modeltyp = 'mbv2' if 'mobilenetv2' in args.model else 'resnet'
+    if 'mobilenetv2_120d' in args.model:
+        modeltyp='mbv2d'
+    if 'v2_rw_s' in args.model:
+        modeltyp='effi_s'
+    print('searching for', modeltyp)
+
+
+    if args.data_aware and args.randomlysample:
+        for alpha in [args.dirichlet_alpha]:
+            # from niid_data import getdirichletprobs, getdataidxs
+            # probs=getdirichletprobs(alpha)
+            # print(probs)
+            # sampler_idxs = getdataidxs(probs, False, 5000)
+            sampler_idxs = np.load('npy/dirichlet_randomlysample_'+str(int(alpha*1000))+'.npy',allow_pickle=True)
+            # np.save('npy/dirichlet_randomlysample_'+str(int(alpha*1000))+'.npy', sampler_idxs)
+            print("finished building sampler for alpha:", alpha)
+            test_set = Subset(dataset_eval, sampler_idxs)
+            loader_test = torch.utils.data.DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=16)
+            original_subnet = model.generate_random_subnet()
+            original_subnet = [0 for _ in range(len(original_subnet))]
+            baseline_acc, baseline_latency = validate(model, loader_test, original_subnet, args, loss_fn, lats)
+            modeltyp = 'effi_s' if args.model == 'efficientnetv2_rw_s' else 'effi_m' # effi is not mobilenetv2 type
+            print('searching for', modeltyp)#, 'results sampled on iid data:', best_infos)
+            from evolution_baseline import generate_subnets
+            subnets = generate_subnets(3000, len(original_subnet), type=modeltyp, lessskip=True)
+            subnets_name = 'npy/effim/'+args.model +str(int(alpha*1000))+ '_dirichlet_subnets.npy'
+            np.save(subnets_name, subnets)
+            niid_accs, niid_lats = [baseline_acc], [baseline_latency]
+            for subnetidx in range(len(subnets)):
+                acc, lat = validate(model, loader_test, subnets[subnetidx], args, loss_fn, lats)
+                niid_accs.append(acc)
+                niid_lats.append(lat)
+                if subnetidx % 200 == 0:
+                    print('*********************************', subnetidx, '***********************************')
+                    print(niid_accs, ',', niid_lats)
+            np.save('npy/effim/data_aware'+str(int(1000*alpha))+args.model + '_randomlysample_results.npy', [niid_accs, niid_lats])
+        exit(0)
+
+    elif args.data_aware:
+        results = []
+        # loader_whole_set = torch.utils.data.DataLoader(dataset_eval, batch_size=args.batch_size, shuffle=False, num_workers=16)
+
+        # iid_subnets = []
+        # dataset_eval_origin = torchvision.datasets.ImageFolder(
+        #     root='../../project1/MultiBranchNet/mobilenet-yolov4-pytorch/pytorch-image-models-master/data/imagenet/ValForDevice_bk',
+        #     transform=data_transform)
+        # loader_eval_origin = torch.utils.data.DataLoader(dataset_eval_origin, batch_size=args.batch_size, shuffle=False,
+        #                                                  num_workers=16)
+        # baseline_subnet = model.generate_random_subnet()
+        # baseline_subnet = [0 for _ in range(len(baseline_subnet))]
+        # baseline_acc, baseline_latency = validate(model, loader_eval_origin, baseline_subnet, args, loss_fn, lats)
+        # for ratio in range(2):
+        #     print('searching for iid, budget ratio:', ratio)
+        #     finder = EvolutionFinder(batch_size=args.batch_size, branch_choices=model.block_choices,
+        #                              time_budget=(0.6 - 0.1 * ratio) * baseline_latency, searching_times=5,
+        #                              lats=lats, modeltype=modeltyp, pruned=args.pruned, propulation_size=120)
+        #     _, best_info = finder.evolution_search(model, validate, loader_eval_origin, args, loss_fn)
+        #     iid_subnets.append(best_info[1])
+        #     results.append(best_info)
+        #     print(best_info)
+        # print('*************************************************************************************')
+        # print(results)
+
+        # results = [(79.03999993896484, [0, 1, 99, 0, 0, 0, 0, 0, 0, 1, 99, 0, 0, 0, 0, 0], 0.020789748885306304, 79.03999993896484), (77.60000002441406, [1, 99, 1, 99, 0, 1, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0.01791440709511538, 77.60000002441406), (76.78000009765626, [2, 99, 99, 1, 99, 1, 99, 0, 0, 1, 99, 0, 0, 0, 0, 0], 0.016388615022165157, 76.78000009765626), (73.51999991455078, [1, 99, 1, 99, 2, 99, 99, 1, 99, 1, 99, 0, 0, 0, 1, 99], 0.013908379665751928, 73.51999991455078), (68.78000007324219, [2, 99, 99, 2, 99, 99, 1, 99, 2, 99, 99, 1, 99, 0, 1, 99], 0.011805535854774065, 68.78000007324219)]
+        # iid_subnets = [[0, 1, 99, 0, 1, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1, 99, 1, 99, 2, 99, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0], [0, 1, 99, 0, 2, 99, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0], [2, 99, 99, 1, 99, 1, 99, 1, 99, 1, 99, 0, 0, 0, 0, 0]]
+        # subnets.append(best_info[1])
+        # alphas = [0.01, 0.05, 0.1, 1.0]
+        # allaccs, alllats = [[] for _ in range(4)], [[] for _ in range(4)]
+        # for niididx in range(4):
+        #     subsetidxs = np.load('npy/dirichlet_'+str(int(alphas[niididx]*100))+'.npy', allow_pickle=True)
+        #     subsetidx = subsetidxs[0]
+        #     eval_set = Subset(dataset_eval, subsetidx)
+        #     loader_eval = torch.utils.data.DataLoader(eval_set, batch_size=args.batch_size, shuffle=False, num_workers=8)
+        #     for subnet in subnets:
+        #         baseline_acc, baseline_latency = validate(model, loader_eval, subnet, args, loss_fn, lats)
+        #         allaccs[niididx].append(baseline_acc)
+        #         alllats[niididx].append(baseline_latency)
+        # print(allaccs, ',', alllats)
+
+
+        # results = [(79.24000004882812, [0, 1, 99, 0, 0, 1, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0.020512275612249838, 79.24000004882812), (76.07999992675781, [1, 99, 1, 99, 1, 99, 0, 1, 99, 1, 99, 0, 0, 0, 0, 0], 0.016048985518263337, 76.07999992675781), (68.55999998779296, [2, 99, 99, 1, 99, 2, 99, 99, 2, 99, 99, 1, 99, 1, 99, 0], 0.011761728007444303, 68.55999998779296)]
+        # iid_subnets = [ [0, 1, 99, 0, 0, 1, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0],[1, 99, 1, 99, 1, 99, 0, 1, 99, 1, 99, 0, 0, 0, 0, 0],  [2, 99, 99, 1, 99, 2, 99, 99, 2, 99, 99, 1, 99, 1, 99, 0]]
+        search = torchvision.datasets.ImageFolder(root='../../project1/MultiBranchNet/mobilenet-yolov4-pytorch/pytorch-image-models-master/data/imagenet/SearchForDevice3k/',transform=data_transform)
+        test = torchvision.datasets.ImageFolder(root='../../project1/MultiBranchNet/mobilenet-yolov4-pytorch/pytorch-image-models-master/data/imagenet/ValForDevice3k/',transform=data_transform)
+        # baseline_latency = 0.07170519512496396
+        for alpha in [args.dirichlet_alpha]:
+            results.append([])
+            from niid_data import getdirichletprobs, getdataidxs
+            # sampler_idxs = get_niid_data(args.data_dir, n_clients=10, DIRICHLET_ALPHA=alpha)
+            probs=getdirichletprobs(alpha)
+            print(probs)
+            sampler_idxs_search=getdataidxs(probs, True, 5000)
+            print(sampler_idxs_search[-1])
+            print(probs)
+            sampler_idxs = getdataidxs(probs, False, 5000)
+            print(sampler_idxs[-1])
+            np.save('npy/dirichlet_search/dirichlet_search_'+str(int(alpha*1000))+'.npy', sampler_idxs_search)
+            np.save('npy/dirichlet_search/dirichlet_test_' + str(int(alpha * 1000)) + '.npy', sampler_idxs)
+            print("finished building sampler for alpha:", alpha)
+            # for i in range(1):
+                # rd.shuffle(sampler_idxs[i])
+                # search_idxs = sampler_idxs[i][:int(0.5*len(sampler_idxs[i]))]
+                # test_idxs = sampler_idxs[i][int(0.5*len(sampler_idxs[i])):]
+                # print("------------------------------", len(search_idxs), len(test_idxs), "----------------------------------------")
+                # eval_set = Subset(dataset_eval, search_idxs)
+                # test_set = Subset(dataset_eval, test_idxs)
+            search_set = Subset(search, sampler_idxs_search)
+            test_set = Subset(test, sampler_idxs)
+            loader_search = torch.utils.data.DataLoader(search_set, batch_size=args.batch_size, shuffle=False, num_workers=16)
+            loader_test = torch.utils.data.DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=16)
+
+            original_subnet = model.generate_random_subnet()
+            original_subnet = [0 for _ in range(len(original_subnet))]
+            baseline_acc, baseline_latency = validate(model, loader_test, original_subnet, args, loss_fn, lats)
+                # loader_test = torch.utils.data.DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=8)
+                # original_acc, original_lat = validate(model, loader_test, original_subnet, args, loss_fn, lats)
+                # original_acc, original_lat = validate(model, loader_eval, original_subnet, args, loss_fn, lats)
+                # baselineaccs, baselinelats = [], []
+                # for ratio in range(4):
+                #     baseline_acc, baseline_latency = validate(model, loader_eval, iid_subnets[ratio], args, loss_fn, lats)
+                #     baselineaccs.append(baseline_acc)
+                #     baselinelats.append(baseline_latency)
+                # best_infos = [(original_acc, original_lat, len(sampler_idxs[i]), baselineaccs, baselinelats)]
+            modeltyp = 'effi_s' #'mbv2' if 'mobilenetv2' in args.model else 'resnet'  # effi is not mobilenetv2 type
+                # because it elasticizes the first conv layer, yet mbv2 didnt
+            print('searching for', modeltyp)#, 'results sampled on iid data:', best_infos)
+                # subnets = mytools.generate_subnets(2500, len(original_subnet))
+                # subnets_name = 'npy/'+args.model + '_subnets.npy'
+                # np.save(subnets_name, subnets)
+                # niid_accs, niid_lats = [], []
+            for ratio in range(10):
+                print("--------------", 0.95-0.05 * ratio, "---------------")
+                finder = EvolutionFinder(batch_size=args.batch_size, branch_choices=model.block_choices,
+                                         time_budget=(0.95-0.05 * ratio) * baseline_latency, searching_times=6,
+                                         lats=lats, modeltype=modeltyp, pruned=args.pruned)
+                _, best_info = finder.evolution_search(model, validate, loader_search, args, loss_fn)
+                test_acc, test_lat = validate(model, loader_test, best_info[1], args, loss_fn, lats)
+                results[-1].append([best_info, (test_acc, test_lat), (baseline_acc, baseline_latency)])
+                print(results)
+                # baseline_acc, baseline_latency = validate(model, loader_test, subnets[ratio], args, loss_fn, lats)
+                # adaptivenet_acc, adaptivenet_latency = validate(model, loader_test, best_info[1], args, loss_fn, lats)
+                #     best_infos.append((baseline_acc, baseline_latency))
+                #     best_infos.append(best_info)
+                #     best_infos.append([adaptivenet_acc, adaptivenet_latency])
+                #     print(best_infos)
+                # for subnetidx in range(len(subnets)):
+                #     acc, lat = validate(model, loader_eval, subnets[subnetidx], args, loss_fn, lats)
+                #     niid_accs.append(acc)
+                #     niid_lats.append(lat)
+                # best_infos.append([niid_accs, niid_lats])
+                # results.append(best_infos)
+            np.save('npy/data_aware'+str(int(1000*alpha)) + '_results.npy', results)
+        exit(0)
+
+
+    # if args.use_subset:
+    #     # idxs = np.random.choice(50000, 1000, replace=False).tolist()
+    #     # np.save('npy/subnet_idxs_effi.npy', idxs)
+    #     idxs = np.load('npy/split_val/set0.npy')
+    #     eval_set = Subset(dataset_eval, idxs)
+    #     dataset_eval = eval_set
+    # loader_eval = torch.utils.data.DataLoader(dataset_eval, batch_size=args.batch_size, shuffle=False, num_workers=16)
+    dataset_eval = torchvision.datasets.ImageFolder(root='/home/wenh/Desktop/project1/MultiBranchNet/mobilenet-yolov4-pytorch/pytorch-image-models-master/data/imagenet/SearchForDevice3k',transform=data_transform)
+    loader_eval = torch.utils.data.DataLoader(dataset_eval, batch_size=args.batch_size, shuffle=False, num_workers=16)
+    dataset_test = torchvision.datasets.ImageFolder(root='/home/wenh/Desktop/project1/MultiBranchNet/mobilenet-yolov4-pytorch/pytorch-image-models-master/data/imagenet/ValForDevice3k',transform=data_transform)
+    loader_test = torch.utils.data.DataLoader(dataset_test, batch_size=args.batch_size, shuffle=False, num_workers=16)
+    print('number of test data:', len(loader_eval)*args.batch_size)
+
+    # infos = [(80.03333333333333, 93.91999999999999), (79.76666666666667, [0, 0, 0, 0, 0, 1, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0], 89.03999999999999, 79.76666666666667), (79.46666666666667, [0, 1, 99, 0, 0, 1, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0], 82.05, 79.46666666666667), (78.33333333333333, [0, 1, 99, 2, 99, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 78.73, 78.33333333333333), (77.73333333333333, [2, 99, 99, 0, 0, 1, 99, 1, 99, 0, 0, 0, 0, 0, 0, 0], 71.69, 77.73333333333333), (77.1000000406901, [2, 99, 99, 1, 99, 1, 99, 1, 99, 0, 0, 0, 0, 0, 0, 0], 66.7, 77.1000000406901), (75.93333335367838, [2, 99, 99, 1, 99, 1, 99, 1, 99, 1, 99, 0, 0, 0, 0, 0], 62.25, 75.93333335367838), (74.23333333333333, [2, 99, 99, 1, 99, 0, 1, 99, 2, 99, 99, 0, 0, 0, 0, 0], 59.95, 74.23333333333333), (72.40000002034505, [2, 99, 99, 1, 99, 2, 99, 99, 0, 1, 99, 0, 0, 0, 1, 99], 54.0, 72.40000002034505), (70.86666668701172, [0, 2, 99, 99, 2, 99, 99, 1, 99, 1, 99, 1, 99, 0, 1, 99], 50.82, 70.86666668701172), (69.40000002034505, [2, 99, 99, 1, 99, 2, 99, 99, 1, 99, 2, 99, 99, 1, 99, 0], 44.84, 69.40000002034505)]
+    # infos = [(80.06666672770183, 0.09802801951915525), (79.16666672770182, [1, 99, 0, 0, 0, 1, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0.08860717250351922, 79.16666672770182), (78.3000000813802, [2, 99, 99, 1, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0.08323883053451078, 78.3000000813802), (77.70000006103515, [2, 99, 99, 0, 0, 1, 99, 1, 99, 0, 0, 0, 0, 0, 0, 0], 0.07932889660863972, 77.70000006103515), (76.76666678873698, [0, 2, 99, 99, 0, 1, 99, 1, 99, 0, 0, 0, 0, 0, 0, 0], 0.0767433699158123, 76.76666678873698), (76.06666676839193, [2, 99, 99, 1, 99, 0, 1, 99, 1, 99, 0, 0, 0, 0, 0, 0], 0.07074933626181305, 76.06666676839193), (74.83333341471354, [1, 99, 1, 99, 1, 99, 2, 99, 99, 0, 0, 0, 0, 0, 0, 0], 0.0683757708622859, 74.83333341471354), (72.96666678873697, [1, 99, 1, 99, 1, 99, 1, 99, 0, 1, 99, 0, 0, 0, 1, 99], 0.0619522975041316, 72.96666678873697), (71.2000001220703, [2, 99, 99, 1, 99, 2, 99, 99, 0, 1, 99, 1, 99, 0, 1, 99], 0.056059509615435654, 71.2000001220703), (69.50000012207032, [2, 99, 99, 1, 99, 0, 1, 99, 2, 99, 99, 0, 0, 2, 99, 99], 0.0536243987322651, 69.50000012207032), (67.13333345540364, [1, 99, 1, 99, 0, 2, 99, 99, 1, 99, 1, 99, 1, 99, 1, 99], 0.04869463451729969, 67.13333345540364)]
+    # infos = [(81.96666668701172, 0.04077928116981021), (81.70000002034506, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 99, 0, 0, 0, 2, 99, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0.03785974630277059, 81.70000002034506), (81.50000002034506, [2, 99, 99, 0, 0, 0, 0, 1, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0.035943912475070325, 81.50000002034506), (81.10000002034505, [2, 99, 99, 0, 0, 0, 0, 0, 0, 1, 99, 0, 0, 0, 0, 0, 0, 0, 2, 99, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0.033988489227390416, 81.10000002034505), (80.23333335367839, [2, 99, 99, 0, 2, 99, 99, 0, 2, 99, 99, 0, 0, 0, 0, 2, 99, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0.0305093776001053, 80.23333335367839), (80.40000014241537, [0, 2, 99, 99, 2, 99, 99, 1, 99, 0, 0, 0, 0, 0, 1, 99, 0, 0, 1, 99, 1, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0.029801400044981916, 80.40000014241537), (80.20000006103515, [2, 99, 99, 1, 99, 1, 99, 0, 1, 99, 0, 0, 2, 99, 99, 0, 0, 1, 99, 0, 0, 1, 99, 0, 1, 99, 0, 0, 0, 0, 0, 0, 0], 0.028477365591648377, 80.20000006103515), (78.36666674804688, [1, 99, 1, 99, 2, 99, 99, 0, 0, 1, 99, 2, 99, 99, 1, 99, 0, 1, 99, 1, 99, 0, 0, 0, 0, 0, 1, 99, 0, 0, 0, 1, 99], 0.025883904088274557, 78.36666674804688), (77.00000004069011, [2, 99, 99, 0, 0, 1, 99, 2, 99, 99, 0, 0, 1, 99, 1, 99, 2, 99, 99, 1, 99, 1, 99, 1, 99, 0, 0, 0, 2, 99, 99, 0, 0], 0.024363410935384012, 77.00000004069011), (76.50000012207032, [0, 2, 99, 99, 1, 99, 2, 99, 99, 2, 99, 99, 1, 99, 2, 99, 99, 2, 99, 99, 2, 99, 99, 0, 0, 0, 0, 1, 99, 0, 0, 0, 0], 0.02224808879131369, 76.50000012207032), (74.80000004069011, [1, 99, 2, 99, 99, 2, 99, 99, 1, 99, 2, 99, 99, 2, 99, 99, 0, 2, 99, 99, 2, 99, 99, 2, 99, 99, 1, 99, 0, 0, 0, 0, 0], 0.02020963381169287, 74.80000004069011)]
+    # infos = [(81.96666668701172, 0.17033889558580192), (81.86666668701172, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 99, 0, 0, 0, 0, 0], 0.16180343820591167, 81.86666668701172), (81.46666670735677, [2, 99, 99, 0, 0, 0, 0, 1, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 99, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0.1480754047933251, 81.46666670735677), (80.7000000406901, [2, 99, 99, 0, 2, 99, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 99, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0.14419917145160713, 80.7000000406901), (79.80000010172526, [2, 99, 99, 0, 2, 99, 99, 0, 2, 99, 99, 1, 99, 2, 99, 99, 0, 0, 0, 0, 1, 99, 0, 0, 0, 0, 1, 99, 0, 0, 0, 0, 0], 0.12261310249868065, 79.80000010172526), (79.36666674804688, [0, 1, 99, 0, 2, 99, 99, 0, 1, 99, 0, 0, 2, 99, 99, 0, 0, 1, 99, 0, 1, 99, 0, 0, 0, 2, 99, 99, 0, 0, 0, 0, 0], 0.12746901704807473, 79.36666674804688), (78.80000010172526, [2, 99, 99, 0, 1, 99, 0, 1, 99, 2, 99, 99, 2, 99, 99, 1, 99, 0, 0, 2, 99, 99, 0, 0, 1, 99, 0, 1, 99, 0, 0, 0, 0], 0.11362079177239931, 78.80000010172526), (78.23333339436849, [2, 99, 99, 0, 2, 99, 99, 2, 99, 99, 1, 99, 2, 99, 99, 1, 99, 0, 0, 2, 99, 99, 0, 0, 0, 0, 1, 99, 0, 0, 1, 99, 0], 0.10718449679288, 78.23333339436849), (76.6, [2, 99, 99, 1, 99, 0, 1, 99, 0, 2, 99, 99, 2, 99, 99, 1, 99, 1, 99, 1, 99, 1, 99, 0, 1, 99, 1, 99, 1, 99, 0, 0, 0], 0.10129272576534387, 76.6), (75.66666672770182, [1, 99, 1, 99, 2, 99, 99, 2, 99, 99, 2, 99, 99, 2, 99, 99, 2, 99, 99, 0, 0, 0, 0, 1, 99, 1, 99, 2, 99, 99, 0, 1, 99], 0.09143223907008316, 75.66666672770182), (73.90000010172525, [2, 99, 99, 1, 99, 2, 99, 99, 1, 99, 2, 99, 99, 2, 99, 99, 1, 99, 2, 99, 99, 2, 99, 99, 2, 99, 99, 2, 99, 99, 0, 0, 0], 0.08433648552557435, 73.90000010172525)]
+    # infos = [(82.00000002034506, 213.93), (82.06666680908204, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 99, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 200.42999999999998, 82.06666680908204), (81.73333335367839, [0, 1, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 99, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 190.42, 81.73333335367839), (81.03333335367839, [0, 1, 99, 0, 2, 99, 99, 0, 0, 0, 0, 0, 1, 99, 0, 0, 0, 0, 1, 99, 0, 0, 0, 0, 0, 1, 99, 0, 0, 0, 0, 0, 0], 174.62, 81.03333335367839), (80.56666670735677, [2, 99, 99, 0, 1, 99, 0, 0, 0, 1, 99, 0, 1, 99, 1, 99, 0, 1, 99, 0, 1, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 165.56, 80.56666670735677), (80.56666670735677, [2, 99, 99, 0, 1, 99, 0, 0, 2, 99, 99, 0, 0, 0, 0, 2, 99, 99, 0, 1, 99, 0, 0, 0, 0, 0, 1, 99, 0, 0, 0, 0, 0], 158.8, 80.56666670735677), (80.06666674804687, [2, 99, 99, 0, 2, 99, 99, 1, 99, 0, 0, 0, 0, 2, 99, 99, 0, 0, 1, 99, 2, 99, 99, 0, 0, 0, 0, 1, 99, 0, 0, 0, 0], 146.02999999999997, 80.06666674804687), (79.16666670735677, [2, 99, 99, 1, 99, 1, 99, 2, 99, 99, 0, 0, 1, 99, 0, 1, 99, 0, 2, 99, 99, 1, 99, 0, 1, 99, 0, 0, 1, 99, 0, 0, 0], 135.51000000000002, 79.16666670735677), (78.36666674804688, [2, 99, 99, 0, 2, 99, 99, 0, 2, 99, 99, 0, 2, 99, 99, 1, 99, 2, 99, 99, 0, 1, 99, 0, 0, 1, 99, 1, 99, 0, 0, 0, 0], 128.06, 78.36666674804688), (77.26666672770182, [1, 99, 1, 99, 2, 99, 99, 2, 99, 99, 1, 99, 0, 0, 1, 99, 2, 99, 99, 1, 99, 1, 99, 2, 99, 99, 1, 99, 1, 99, 0, 0, 0], 113.18000000000002, 77.26666672770182), (76.40000010172525, [2, 99, 99, 0, 2, 99, 99, 1, 99, 0, 0, 2, 99, 99, 0, 0, 2, 99, 99, 1, 99, 1, 99, 1, 99, 2, 99, 99, 2, 99, 99, 0, 0], 106.57000000000001, 76.40000010172525)]
+    # infos = [(81.96666670735677, 0.17033889558580192), (82.06666691080729, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 99, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0.16174145419188224, 82.06666691080729), (81.53333347574869, [0, 0, 0, 0, 0, 0, 0, 0, 2, 99, 99, 0, 0, 1, 99, 0, 0, 1, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0.15310402109165386, 81.53333347574869), (81.26666691080729, [2, 99, 99, 0, 0, 0, 0, 0, 2, 99, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 99, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0.1437453886475226, 81.26666691080729), (80.46666670735677, [0, 1, 99, 0, 0, 1, 99, 1, 99, 1, 99, 1, 99, 0, 0, 0, 1, 99, 0, 1, 99, 0, 0, 0, 0, 1, 99, 0, 0, 0, 0, 0, 0], 0.1356900027303985, 80.46666670735677), (80.36666680908203, [2, 99, 99, 0, 0, 1, 99, 0, 2, 99, 99, 0, 0, 2, 99, 99, 0, 0, 0, 1, 99, 1, 99, 0, 0, 0, 0, 1, 99, 0, 0, 0, 0], 0.1265200942453712, 80.36666680908203), (79.49999993896485, [2, 99, 99, 0, 2, 99, 99, 1, 99, 1, 99, 0, 0, 1, 99, 1, 99, 0, 0, 0, 2, 99, 99, 1, 99, 1, 99, 1, 99, 0, 0, 0, 0], 0.11397629073171905, 79.49999993896485), (79.16666697184245, [1, 99, 1, 99, 2, 99, 99, 2, 99, 99, 2, 99, 99, 1, 99, 1, 99, 2, 99, 99, 0, 1, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0.11071617916376902, 79.16666697184245), (77.33333343505859, [2, 99, 99, 1, 99, 1, 99, 2, 99, 99, 1, 99, 2, 99, 99, 2, 99, 99, 2, 99, 99, 1, 99, 2, 99, 99, 0, 0, 1, 99, 0, 0, 0], 0.0967451273792922, 77.33333343505859), (76.30000006103515, [1, 99, 1, 99, 2, 99, 99, 1, 99, 1, 99, 0, 2, 99, 99, 2, 99, 99, 1, 99, 2, 99, 99, 0, 1, 99, 0, 2, 99, 99, 0, 1, 99], 0.09170269002818096, 76.30000006103515), (74.30000030517579, [1, 99, 2, 99, 99, 0, 0, 2, 99, 99, 2, 99, 99, 2, 99, 99, 1, 99, 1, 99, 2, 99, 99, 2, 99, 99, 1, 99, 2, 99, 99, 0, 0], 0.08476627234256628, 74.30000030517579)]
+    # infos = [(81.93333337402343, 0.04077928116981021), (81.73333357747396, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 99, 99, 1, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0.037850366814414026, 81.73333357747396), (81.43333363850911, [0, 0, 0, 1, 99, 0, 0, 0, 0, 1, 99, 2, 99, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0.03647327900529655, 81.43333363850911), (81.16666687011718, [2, 99, 99, 0, 0, 0, 0, 2, 99, 99, 0, 0, 0, 1, 99, 0, 0, 0, 1, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0.03302748063031365, 81.16666687011718), (81.00000030517577, [2, 99, 99, 0, 2, 99, 99, 0, 1, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 99, 1, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0.031512650142473925, 81.00000030517577), (80.33333357747397, [2, 99, 99, 0, 1, 99, 0, 1, 99, 1, 99, 1, 99, 0, 0, 0, 0, 0, 0, 1, 99, 1, 99, 0, 0, 0, 0, 0, 1, 99, 0, 0, 0], 0.029762885448183674, 80.33333357747397), (80.00000004069011, [1, 99, 2, 99, 99, 1, 99, 0, 1, 99, 0, 0, 1, 99, 0, 0, 0, 0, 1, 99, 2, 99, 99, 0, 0, 0, 0, 1, 99, 0, 0, 0, 0], 0.027874292808122116, 80.00000004069011), (79.33333353678385, [1, 99, 2, 99, 99, 1, 99, 2, 99, 99, 0, 0, 0, 1, 99, 0, 0, 1, 99, 1, 99, 1, 99, 1, 99, 0, 1, 99, 0, 0, 0, 0, 0], 0.025925864266215334, 79.33333353678385), (78.133333597819, [2, 99, 99, 0, 2, 99, 99, 1, 99, 1, 99, 2, 99, 99, 0, 2, 99, 99, 1, 99, 2, 99, 99, 0, 0, 0, 2, 99, 99, 0, 0, 0, 0], 0.023668149236743534, 78.133333597819), (77.23333333333333, [1, 99, 1, 99, 2, 99, 99, 1, 99, 1, 99, 1, 99, 2, 99, 99, 1, 99, 2, 99, 99, 2, 99, 99, 1, 99, 0, 1, 99, 0, 0, 0, 0], 0.021893480692399155, 77.23333333333333), (75.40000010172525, [2, 99, 99, 0, 2, 99, 99, 2, 99, 99, 2, 99, 99, 2, 99, 99, 0, 2, 99, 99, 2, 99, 99, 0, 0, 2, 99, 99, 2, 99, 99, 0, 0], 0.02016755725922662, 75.40000010172525)]    # subnets, latencys = [], []
+    # for i in range(1, len(infos)):
+    #     subnets.append(infos[i][1])
+    #     latencys.append(infos[i][2])
+    # acccs, laats = [], []
+    # for subnet in subnets:
+    #     baseline_acc, baseline_latency = validate(model, loader_test, subnet, args, loss_fn, lats)
+    #     acccs.append(baseline_acc)
+    #     laats.append(baseline_latency)
+    # print(acccs, ',', latencys)
+    # exit(0)
+    baseline_subnet = model.generate_random_subnet()
+    baseline_subnet = [0 for _ in range(len(baseline_subnet))]
+
+    # subnets = mytools.generate_subnets(sample_num=2000, model_len=len(baseline_subnet),
+    #                                            pruned=False, prune_points=None, type=modeltyp)
+    # baseline_acc, baseline_latency = validate(model, loader_eval, baseline_subnet, args, loss_fn, lats)
+    '''to randomly sample subnets and test them'''
+    # accs, latencys, randomsubnets = [baseline_acc], [baseline_latency], [baseline_subnet]
+    # name = 'npy/'+args.model+'subnets.npy'
+    # np.save(name, subnets)
+    # for idx in range(len(subnets)):
+    #     acc, latency = validate(model, loader_eval, subnets[idx], args, loss_fn, lats)
+    #     accs.append(acc)
+    #     latencys.append(latency)
+    #     if idx % 50 == 0:
+    #         print(idx,',',  accs, ',', latencys)
+    # print(accs, ',', latencys)
+    '''end of randomly sampling'''
+    # import pdb;pdb.set_trace()
+    # teachermodel = timm.create_model('resnet50', pretrained=True)
+    # if args.GPU:
+    #     teachermodel.cuda()
+    # warmup(teachermodel, args, 100, teachermodel=True)
+    # for _ in range(3):
+    #     validate(teachermodel, loader_eval, baseline_subnet, args, loss_fn, teachermodel=True)
+
+    baseline_acc, baseline_latency = validate(model, loader_eval, baseline_subnet, args, loss_fn, lats)
+    model_len = len(baseline_subnet)
+    pruned_points = []
+    for i in range(model_len):
+        for j in range(len(model.block_choices[i])):
+            if model.block_choices[i][j] < 0:
+                pruned_points.append(i)
+                break
+
+    if 'resnet' in args.model:
+        pruned_points = [i for i in range(len(baseline_subnet))]
+    print("pruned_points:", pruned_points)
+    # originalmodel.cpu()
+    best_infos = [(baseline_acc, baseline_latency)]
+    for ratio in range(10):
+        print("--------------", 0.95-0.05*ratio, "---------------")
+        # lens = layer_lens if "mobilenetv2" in args.model else None
+        # searchtime=6 if 'efficientnetv2' in args.model else 4
+        finder = EvolutionFinder(batch_size=args.batch_size, branch_choices=model.block_choices,
+                                 time_budget=(0.95-0.05*ratio)*baseline_latency, searching_times=10, lats=lats, modeltype=modeltyp, pruned=args.pruned, pruned_points=pruned_points, propulation_size=200)
+
+        _, best_info = finder.evolution_search(model, validate, loader_eval, args, loss_fn)
+        test_acc, test_lat = validate(model, loader_test, best_info[1], args, loss_fn, lats)
+        best_infos.append([best_info, test_acc, test_lat])
+        print(best_infos)
+    print(best_infos)
+
+
+if __name__ == '__main__':
+    main()
