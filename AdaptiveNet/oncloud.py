@@ -337,3 +337,212 @@ def init_resnet_multiblocks(model, args):
                     #         layerchoice.downsample[2].running_var.data = blockchoice[0].downsample[2].running_var.data.clone().detach()
                     #         layerchoice.downsample[2].num_batches_tracked.data = blockchoice[0].downsample[2].num_batches_tracked.data.clone().detach()
                     print(idx)
+
+################################### for segmentation ##########################################
+def _layeridx2multmodelidx(layeridx, block_idx, block_choice_idx, layer_len_list):  # layeridx = 1, 2, 3, 4
+    multiblockidx = [0, block_choice_idx]
+    for i in range(1, layeridx):
+        multiblockidx[0] += layer_len_list[i - 1]
+    multiblockidx[0] += block_idx
+    multiblockidxstr = "multiblocks." + str(multiblockidx[0]) + "." + str(multiblockidx[1]) + "."
+    return multiblockidxstr
+
+
+def _headlayer2multiResDetLayer(layeridx, block_idx):
+    newlayeridx = 2 if layeridx == 1 else layeridx
+    newblockidx = block_idx if layeridx != 2 else block_idx + 3
+    new_key = "model.backbone." + "layer" + str(newlayeridx) + "." + str(newblockidx) + ".0."
+    return new_key
+
+
+def no_new_subnet(subnet):
+    no_new = True
+    for i in range(len(subnet)):
+        for j in range(len(subnet[i])):
+            if subnet[i][j] != 0:
+                no_new = False
+    return no_new
+
+def load_to_multimodel(path, multimodel, part="head", freeze_head=True):
+    pretrained_model_dict = torch.load(path, map_location=torch.device('cpu'))
+    multimodel_dict = multimodel.state_dict()
+    state = {}
+    if part == "head":  # load the head and the original main subnet, freeze this subnet and the head
+        key_list = ["decoder", "segmentation_head"]
+        for k, v in pretrained_model_dict.items():
+            # head_flag = False
+            for _k in key_list:
+                if _k in k:
+                    state[k] = v
+                    # print(k)
+        multimodel_dict.update(state)
+        multimodel.load_state_dict(multimodel_dict)
+        if freeze_head:
+            for (name, parameter) in multimodel.named_parameters():
+                if name in state:
+                    parameter.requires_grad = False
+                    print(';;;', name)
+        return multimodel, state
+    else:
+        # multimodel_dict.items():model.backbone.conv1.weight, model.backbone.layer2.0.0.conv1.weight...
+        # pretrained_model_dict.items():conv1.weight,multiblocks.0.0.conv1.weight...
+        for k, v in multimodel_dict.items():
+            k_list = k.split('.')
+            if k_list[1] == "conv1" or k_list[1] == "bn1":
+                state[k] = pretrained_model_dict[k[8:]]
+                # print(k[8:])
+            else:
+                k_list = k.split('.', 4)
+                if k_list[0] != "decoder" and k_list[0] != "segmentation_head":
+                    multiblockidxstr = _layeridx2multmodelidx(layeridx=int(k_list[1][-1]), block_idx=int(k_list[2]),
+                                                              block_choice_idx=int(k_list[3]), layer_len_list=[3, 4, 6, 3])
+                    multiblockkey = multiblockidxstr + k_list[4]
+                    # print(multiblockkey)
+                    state[k] = pretrained_model_dict[multiblockkey]
+        # for k, v in state.items():
+        #     print("multimodelkeys:", k)
+        multimodel_dict.update(state)
+        multimodel.load_state_dict(multimodel_dict)
+        for (name, parameter) in multimodel.named_parameters():
+            namek = name.split('.')
+            if name in state and (len(namek) > 3 and namek[3]=='0'):
+                parameter.requires_grad = False
+                print(';;;', name)
+            if len(namek) == 3:
+                parameter.requires_grad = False
+                print(';;;', name)
+        return multimodel
+
+
+def freeze_main_subnet(multimodel, state):
+    for (k, v) in multimodel.named_parameters():
+        # print(k)
+        if k in state:
+            # print(";;;", k)
+            v.requires_grad = False
+    multimodel.model.backbone.conv1.eval()
+    multimodel.model.backbone.bn1.eval()
+    for blockidx in range(len(multimodel.model.backbone.layer2)):
+        multimodel.model.backbone.layer2[blockidx][0].eval()
+    for blockidx in range(len(multimodel.model.backbone.layer3)):
+        multimodel.model.backbone.layer3[blockidx][0].eval()
+    for blockidx in range(len(multimodel.model.backbone.layer4)):
+        multimodel.model.backbone.layer4[blockidx][0].eval()
+    multimodel.model.fpn.eval()
+    multimodel.model.class_net.eval()
+    multimodel.model.box_net.eval()
+
+
+#################################### for object detection #######################################
+def load_to_detectionmodel(path, multimodel, part="head", freeze_head=False):
+    pretrained_model_dict = torch.load(path, map_location=torch.device('cpu'))
+    multimodel_dict = multimodel.state_dict()
+    state = {}
+    if part == "head":  # load the head and the original main subnet, freeze this subnet and the head
+        key_list = ["fpn", "class_net", "box"]
+        for k, v in pretrained_model_dict.items():
+            head_flag = False
+            for _k in key_list:
+                if _k in k:
+                    key = "model." + k
+                    state[key] = v
+                    head_flag = True
+            if not head_flag:
+                k_list = k.split('.')
+                if len(k_list) <= 3:
+                    key = "model." + k
+                else:
+                    k_list = k.split('.', 3)
+                    key = _headlayer2multiResDetLayer(int(k_list[1][-1]), int(k_list[2]))
+                    key += k_list[3]
+                state[key] = v
+        # for k, v in state.items():
+        #     print("headkeys:", k)
+        multimodel_dict.update(state)
+        multimodel.load_state_dict(multimodel_dict)
+        if freeze_head:
+            for (name, parameter) in multimodel.named_parameters():
+                if name in state:
+                    parameter.requires_grad = False
+        return multimodel, state
+    else:
+        # multimodel_dict.items():model.backbone.conv1.weight, model.backbone.layer2.0.0.conv1.weight...
+        # pretrained_model_dict.items():conv1.weight,multiblocks.0.0.conv1.weight...
+        for k, v in multimodel_dict.items():
+            if k == "anchors.boxes":
+                continue
+            k_list = k.split('.')
+            if k_list[2] == "conv1" or k_list[2] == "bn1":
+                state[k] = pretrained_model_dict[k[15:]]
+            else:
+                k_list = k.split('.', 5)
+                if k_list[1] != "fpn" and k_list[1] != "class_net" and k_list[1] != "box_net":
+                    multiblockidxstr = _layeridx2multmodelidx(layeridx=int(k_list[2][-1]), block_idx=int(k_list[3]),
+                                                              block_choice_idx=int(k_list[4]), layer_len_list=[7, 6, 3])
+                    multiblockkey = multiblockidxstr + k_list[5]
+                    state[k] = pretrained_model_dict[multiblockkey]
+        # for k, v in state.items():
+        #     print("multimodelkeys:", k)
+        multimodel_dict.update(state)
+        multimodel.load_state_dict(multimodel_dict)
+        return multimodel
+
+def freeze_detection_main_subnet(multimodel, state):
+    for (k, v) in multimodel.named_parameters():
+        # print(k)
+        if k in state:
+            # print(";;;", k)
+            v.requires_grad = False
+    multimodel.model.backbone.conv1.eval()
+    multimodel.model.backbone.bn1.eval()
+    for blockidx in range(len(multimodel.model.backbone.layer2)):
+        multimodel.model.backbone.layer2[blockidx][0].eval()
+    for blockidx in range(len(multimodel.model.backbone.layer3)):
+        multimodel.model.backbone.layer3[blockidx][0].eval()
+    for blockidx in range(len(multimodel.model.backbone.layer4)):
+        multimodel.model.backbone.layer4[blockidx][0].eval()
+    multimodel.model.fpn.eval()
+    multimodel.model.class_net.eval()
+    multimodel.model.box_net.eval()
+
+def freeze_detection_bn(multimodel):
+    # for layer in multimodel.model.modules():
+    #     if isinstance(layer, torch.nn.BatchNorm2d):
+    #         layer.eval()
+    multimodel.model.backbone.bn1.eval()
+    for blockidx in range(len(multimodel.model.backbone.layer2)):
+        multimodel.model.backbone.layer2[blockidx][0].bn1.eval()
+        multimodel.model.backbone.layer2[blockidx][0].bn2.eval()
+        multimodel.model.backbone.layer2[blockidx][0].bn3.eval()
+        if multimodel.model.backbone.layer2[blockidx][0].downsample is not None:
+            multimodel.model.backbone.layer2[blockidx][0].downsample[1].eval()
+    for blockidx in range(len(multimodel.model.backbone.layer3)):
+        multimodel.model.backbone.layer3[blockidx][0].bn1.eval()
+        multimodel.model.backbone.layer3[blockidx][0].bn2.eval()
+        multimodel.model.backbone.layer3[blockidx][0].bn3.eval()
+        if multimodel.model.backbone.layer3[blockidx][0].downsample is not None:
+            multimodel.model.backbone.layer3[blockidx][0].downsample[1].eval()
+    for blockidx in range(len(multimodel.model.backbone.layer4)):
+        multimodel.model.backbone.layer4[blockidx][0].bn1.eval()
+        multimodel.model.backbone.layer4[blockidx][0].bn2.eval()
+        multimodel.model.backbone.layer4[blockidx][0].bn3.eval()
+        if multimodel.model.backbone.layer4[blockidx][0].downsample is not None:
+            multimodel.model.backbone.layer4[blockidx][0].downsample[1].eval()
+    for layer in multimodel.model.fpn.modules():
+        # if isinstance(layer, torch.nn.BatchNorm2d):
+        layer.eval()
+    for layer in multimodel.model.class_net.modules():
+        # if isinstance(layer, torch.nn.BatchNorm2d):
+        layer.eval()
+    for layer in multimodel.model.box_net.modules():
+        # print(layer)
+        # if isinstance(layer, torch.nn.BatchNorm2d):
+        layer.eval()
+
+def no_new_detection_subnet(subnet):
+    no_new = True
+    for i in range(len(subnet)):
+        for j in range(len(subnet[i])):
+            if subnet[i][j] != 0:
+                no_new = False
+    return no_new

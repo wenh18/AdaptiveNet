@@ -715,7 +715,7 @@ class EfficientDet(nn.Module):
                 choice = layerchoices[blockidx]
             else:
                 choices = [i for i in range(layerchoices[blockidx] + 1)]
-                choices += [-1, -2]  # for pruned blocks
+                # choices += [-1, -2]  # for pruned blocks
                 choice = np.random.choice(choices)
             if choice == 1:
                 sublayer += [1, 99]
