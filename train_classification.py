@@ -408,10 +408,16 @@ def main():
     teachermodel = timm.create_model(args.model, pretrained=True)
     teachermodel.eval()
     if args.prune:
-        prune_modules = oncloud.prune_mbv2(teachermodel, [0.25, 0.5])
+        if 'mobilenet' in args.model:
+            prune_modules = oncloud.prune_mbv2(teachermodel, [0.25, 0.5])
+        elif 'resnet' in args.model:
+            prune_modules = oncloud.prune_resnet(teachermodel, [0.25, 0.5])
         model.get_pruned_module(prune_modules)
     teachermodel.cuda()
     weights = args.original_model if args.stage == 0 else args.distilled_model
+    torch.save(model.state_dict(), 'resnet50.pth')
+    # print(model)
+    # exit(0)
     if 'resnet' in args.model:
         teachernet_map = oncloud.load_resnet_checkpoint(model, weights, args.stage, args)
     elif 'mobilenetv2' in args.model or 'efficientnetv2' in args.model:
