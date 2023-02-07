@@ -15,16 +15,27 @@ def no_grad_fn(subnet):
 def prune_mbv2_block(model, example, prune_rate):
     x = torch.rand(example.shape)
     model.cpu()
-    DG = tp.DependencyGraph().build_dependency(model, x)
-
-    def prune_conv(conv, amount=0.2):
-        strategy = tp.strategy.L1Strategy()
-        pruning_index = strategy(conv.weight, amount=amount)
-        plan = DG.get_pruning_plan(conv, tp.prune_conv, pruning_index)
-        plan.exec()
-
-    prune_conv(model.conv_pw, prune_rate)
-    prune_conv(model.conv_dw, prune_rate)
+    imp = tp.importance.MagnitudeImportance(p=2)
+    # import pdb;pdb.set_trace()
+    ignored_layers = []
+    for m in model.modules():
+        if isinstance(m, torch.nn.Linear):
+            ignored_layers.append(m)
+    pruner = tp.pruner.GroupNormPruner(model=model, example_inputs=x,
+                                       importance=imp, iterative_steps=1,
+                                       ch_sparsity=prune_rate, ignored_layers=ignored_layers)
+    pruner.step()
+    # DG = tp.DependencyGraph().build_dependency(model, x)
+    #
+    # def prune_conv(conv, amount=0.2):
+    #     strategy = tp.strategy.L1Strategy()
+    #     pruning_index = strategy(conv.weight, amount=amount)
+    #     # pruner = tp.pruner.MagnitudePruner(conv, )
+    #     plan = DG.get_pruning_plan(conv, tp.prune_conv, pruning_index)
+    #     plan.exec()
+    #
+    # prune_conv(model.conv_pw, prune_rate)
+    # prune_conv(model.conv_dw, prune_rate)
     return model
 
 def prune_mbv2(model, prune_rate_list):
@@ -44,12 +55,49 @@ def prune_mbv2(model, prune_rate_list):
         x = torch.rand(1, 3, 224, 224)
         x = model.conv_stem(x)
         x = model.bn1(x)
-        x = model.act1(x)
+        # x = model.act1(x)
         x = model.blocks[0](x)
         for layeridx in range(1, 6):
             tmp_blocks += prune_layer_blocks(x, cp_model.blocks[layeridx], rate)
             x = model.blocks[layeridx](x)
         for ii in range(15):
+            blocks[ii].append(tmp_blocks[ii])
+    return blocks
+
+
+def prune_resnet(model, prune_rate_list):
+    '''return:[[block1_prunerate1, block1_prunerate2],...[blockn_prunerate1, blockn_prunerate2]]'''
+    model.cpu()
+    def prune_layer_blocks(input, layer, prune_rate):
+        layer_blocks = []
+        for i in range(len(layer)):
+            tmp = layer[i](input)
+            layer_blocks.append(prune_mbv2_block(layer[i], input, prune_rate))
+            input = tmp
+        return layer_blocks
+    blocks = [[] for _ in range(16)]
+    for rate in prune_rate_list:
+        cp_model = copy.deepcopy(model)
+        tmp_blocks = []
+        x = torch.rand(1, 3, 224, 224)
+        x = model.conv1(x)
+        x = model.bn1(x)
+        x = model.act1(x)
+        x = model.maxpool(x)
+        # for layeridx in range(1, 6):
+        tmp_blocks += prune_layer_blocks(x, cp_model.layer1, rate)
+        x = model.layer1(x)
+
+        tmp_blocks += prune_layer_blocks(x, cp_model.layer2, rate)
+        x = model.layer2(x)
+
+        tmp_blocks += prune_layer_blocks(x, cp_model.layer3, rate)
+        x = model.layer3(x)
+
+        tmp_blocks += prune_layer_blocks(x, cp_model.layer4, rate)
+        # x = model.layer4(x)
+        # import pdb;pdb.set_trace()
+        for ii in range(16):
             blocks[ii].append(tmp_blocks[ii])
     return blocks
 
